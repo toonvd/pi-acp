@@ -712,7 +712,7 @@ export class PiAcpSession {
               this.emit({
                 sessionUpdate: 'tool_call',
                 toolCallId,
-                title: toolName,
+                title: toolCallTitle(toolName, rawInput),
                 kind: toToolKind(toolName),
                 status,
                 locations,
@@ -787,17 +787,20 @@ export class PiAcpSession {
 
         const locations = toToolCallLocations(args, this.cwd, line)
 
+        const parentMeta = parentToolCallMeta(ev)
+
         // If we already surfaced the tool call while the model streamed it, just transition.
         if (!this.currentToolCalls.has(toolCallId)) {
           this.currentToolCalls.set(toolCallId, 'in_progress')
           this.emit({
             sessionUpdate: 'tool_call',
             toolCallId,
-            title: toolName,
+            title: toolCallTitle(toolName, args),
             kind: toToolKind(toolName),
             status: 'in_progress',
             locations,
-            rawInput: args
+            rawInput: args,
+            ...parentMeta
           })
         } else {
           this.currentToolCalls.set(toolCallId, 'in_progress')
@@ -806,7 +809,8 @@ export class PiAcpSession {
             toolCallId,
             status: 'in_progress',
             locations,
-            rawInput: args
+            rawInput: args,
+            ...parentMeta
           })
         }
 
@@ -832,7 +836,8 @@ export class PiAcpSession {
           content: text
             ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
             : undefined,
-          ...(this.fileMutationToolCallIds.has(toolCallId) ? {} : { rawOutput: partial })
+          ...(this.fileMutationToolCallIds.has(toolCallId) ? {} : { rawOutput: partial }),
+          ...parentToolCallMeta(ev)
         })
         break
       }
@@ -889,7 +894,8 @@ export class PiAcpSession {
           toolCallId,
           status: isError ? 'failed' : 'completed',
           content,
-          ...(hasStructuredDiff ? {} : { rawOutput: result })
+          ...(hasStructuredDiff ? {} : { rawOutput: result }),
+          ...parentToolCallMeta(ev)
         })
 
         this.cleanupToolCall(toolCallId)
@@ -1125,6 +1131,57 @@ function formatAutoRetryMessage(ev: PiRpcEvent): string {
   return `Retrying (attempt ${attempt}/${maxAttempts}, waiting ${delaySeconds}s)...`
 }
 
+/**
+ * Subagent is a real tool from the pi-subagents extension (params: agent, task,
+ * workflow, and args.tasks[] for parallel). ACP's ToolKind enum has no subagent
+ * value, so the tool-call title carries the identity.
+ */
+function isSubagentTool(toolName: string): boolean {
+  return toolName === 'subagent' || /^subagent/i.test(toolName)
+}
+
+/**
+ * Human-readable title for a tool call. Subagent calls carry the agent name and
+ * task so they render as a named block in Zed instead of a bare "subagent". All
+ * other tools keep their raw name (bash has its own title path).
+ */
+export function toolCallTitle(toolName: string, args: unknown): string {
+  if (!isSubagentTool(toolName)) return toolName
+
+  const record = args as
+    | { agent?: unknown; task?: unknown; workflow?: unknown; args?: { tasks?: unknown } }
+    | null
+    | undefined
+  const agent = typeof record?.agent === 'string' && record.agent.trim() ? record.agent.trim() : undefined
+  const task = typeof record?.task === 'string' && record.task.trim() ? record.task.trim() : undefined
+
+  if (agent && task) return `subagent: ${agent} — ${truncateTask(task)}`
+  if (record?.workflow === 'parallel' && Array.isArray(record.args?.tasks)) {
+    return `subagent: parallel (${record.args.tasks.length} tasks)`
+  }
+  if (agent) return `subagent: ${agent}`
+  return 'subagent'
+}
+
+function truncateTask(task: string): string {
+  const singleLine = task.replace(/\s+/g, ' ').trim()
+  return singleLine.length > 60 ? `${singleLine.slice(0, 57)}...` : singleLine
+}
+
+/**
+ * Surfaces pi's `parentToolCallId` (added for nested/child tool calls) in the
+ * emitted update's `_meta` so the hierarchy is inspectable. Absent when the
+ * incoming event has no parentToolCallId — ACP has no parent/child field.
+ */
+function parentToolCallMeta(
+  ev: unknown
+): { _meta: { parentToolCallId: string } } | Record<string, never> {
+  const parentToolCallId = (ev as any)?.parentToolCallId
+  return typeof parentToolCallId === 'string' && parentToolCallId
+    ? { _meta: { parentToolCallId } }
+    : {}
+}
+
 function toToolKind(toolName: string): ToolKind {
   switch (toolName) {
     case 'read':
@@ -1134,6 +1191,10 @@ function toToolKind(toolName: string): ToolKind {
       return 'edit'
     case 'bash':
       return 'execute'
+    // subagent (pi-subagents extension) and any /^subagent/i variant stay 'other':
+    // ACP's ToolKind enum has no subagent value — the tool-call title carries the identity.
+    case 'subagent':
+      return 'other'
     default:
       return 'other'
   }
