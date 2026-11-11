@@ -33,7 +33,6 @@ const child = spawn('node', ['dist/index.js'], {
 })
 
 let stdoutBuffer = ''
-let stderrBuffer = ''
 let timedOut = false
 let finished = false
 
@@ -66,7 +65,6 @@ child.stdout.on('data', chunk => {
 
 child.stderr.setEncoding('utf8')
 child.stderr.on('data', chunk => {
-  stderrBuffer += chunk
   for (const line of chunk.split('\n')) {
     if (line.trim()) console.log(`>>ERR ${line}`)
   }
