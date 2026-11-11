@@ -58,7 +58,7 @@ test('PiAcpSession: emits ACP diff content for edit tool from actual before/afte
   assert.ok(Array.isArray(content), 'expected content array')
   const diff = content.find(c => c.type === 'diff')
   assert.ok(diff, 'expected diff content item')
-  assert.equal(diff.path, 'a.txt')
+  assert.equal(diff.path, join(dir, 'a.txt'))
   assert.equal(diff.oldText, 'before\n')
   assert.equal(diff.newText, 'after\n')
   assert.equal((end.update as any).rawOutput, undefined, 'expected raw output to be suppressed when diff is emitted')
@@ -174,10 +174,40 @@ test('PiAcpSession: emits write diff content from actual before/after file conte
   assert.ok(end, 'expected completed tool_call_update')
   const diff = (end.update as any).content?.find((c: any) => c.type === 'diff')
   assert.ok(diff, 'expected diff content item')
-  assert.equal(diff.path, 'a.txt')
+  assert.equal(diff.path, join(dir, 'a.txt'))
   assert.equal(diff.oldText, 'before\n')
   assert.equal(diff.newText, 'after\n')
   assert.equal((end.update as any).rawOutput, undefined, 'expected raw output to be suppressed when diff is emitted')
+})
+
+test('PiAcpSession: relative rawInput.path is emitted as an absolute diff path and still reads the right file', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-diff-'))
+  mkdirSync(dir, { recursive: true })
+  const filePath = join(dir, 'a.txt')
+  writeFileSync(filePath, 'before\n', 'utf8')
+
+  const { conn, proc } = createSession(dir)
+
+  // rawInput.path is relative; the emitted diff path MUST resolve against cwd.
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'edit', args: { path: 'a.txt' } })
+  writeFileSync(filePath, 'after\n', 'utf8')
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    isError: false,
+    result: { content: [{ type: 'text', text: 'ok' }] }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const end = completedToolUpdate(conn)
+  assert.ok(end, 'expected completed tool_call_update')
+
+  const diff = (end.update as any).content?.find((c: any) => c.type === 'diff')
+  assert.ok(diff, 'expected diff content item')
+  assert.equal(diff.path, join(dir, 'a.txt'), 'relative path must be resolved against cwd')
+  assert.equal(diff.oldText, 'before\n', 'relative path must still read the right file')
+  assert.equal(diff.newText, 'after\n')
 })
 
 test('PiAcpSession: emits write diff content for new files on completion', async () => {
@@ -208,7 +238,7 @@ test('PiAcpSession: emits write diff content for new files on completion', async
   assert.ok(end, 'expected completed tool_call_update')
   const diff = (end.update as any).content?.find((c: any) => c.type === 'diff')
   assert.ok(diff, 'expected diff content item')
-  assert.equal(diff.path, 'new.txt')
+  assert.equal(diff.path, join(dir, 'new.txt'))
   assert.equal(diff.oldText, null)
   assert.equal(diff.newText, 'created\n')
 })
