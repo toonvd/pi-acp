@@ -767,10 +767,12 @@ export class PiAcpSession {
           this.fileMutationToolCallIds.add(toolCallId)
           const p = getToolPath(args)
           if (p) {
+            // Zed resolves diff paths against the project root, so snapshot and
+            // emit the resolved ABSOLUTE path rather than the raw tool arg.
+            const abs = isAbsolute(p) ? p : resolvePath(this.cwd, p)
             try {
-              const abs = isAbsolute(p) ? p : resolvePath(this.cwd, p)
               snapshotOldText = readFileSync(abs, 'utf8')
-              this.fileSnapshots.set(toolCallId, { path: p, oldText: snapshotOldText })
+              this.fileSnapshots.set(toolCallId, { path: abs, oldText: snapshotOldText })
 
               if (toolName === 'edit') {
                 for (const needle of getEditOldTexts(args)) {
@@ -780,7 +782,7 @@ export class PiAcpSession {
               }
             } catch {
               snapshotOldText = null
-              this.fileSnapshots.set(toolCallId, { path: p, oldText: null })
+              this.fileSnapshots.set(toolCallId, { path: abs, oldText: null })
             }
           }
         }
