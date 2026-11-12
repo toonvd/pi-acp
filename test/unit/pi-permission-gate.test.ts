@@ -3,9 +3,9 @@ import assert from 'node:assert/strict'
 import gate from '../../src/acp/pi-permission-gate.js'
 
 type GateHandler = (event: unknown, ctx: unknown) => Promise<unknown>
-type ConfirmCall = { title: string; message: string }
+type ConfirmCall = { title: string; message: string; options?: { timeout?: number } }
 
-function loadGate(confirm: (title: string, message: string) => Promise<unknown>) {
+function loadGate(confirm: (title: string, message: string, options?: { timeout?: number }) => Promise<unknown>) {
   const handlers: Record<string, GateHandler[]> = {}
   const pi = {
     on(event: string, handler: GateHandler) {
@@ -16,9 +16,9 @@ function loadGate(confirm: (title: string, message: string) => Promise<unknown>)
   const confirmCalls: ConfirmCall[] = []
   const ctx = {
     ui: {
-      confirm: async (title: string, message: string) => {
-        confirmCalls.push({ title, message })
-        return confirm(title, message)
+      confirm: async (title: string, message: string, options?: { timeout?: number }) => {
+        confirmCalls.push({ title, message, options })
+        return confirm(title, message, options)
       }
     }
   }
@@ -68,6 +68,25 @@ test('pi-permission-gate: includes the path and edit count in the message', asyn
     ctx
   )
   assert.equal(confirmCalls[0].message, 'pi-acp:toolcall=tc-1\nEdit src/a.ts (2 edits)')
+})
+
+test('pi-permission-gate: counts a single edit object as one edit', async () => {
+  const { handler, confirmCalls, ctx } = loadGate(async () => true)
+  // pi normalizes a non-array {oldText,newText} into a one-element array; the gate
+  // must count it as one edit instead of zero.
+  await handler!(
+    toolCall({ input: { path: 'src/a.ts', edits: { oldText: 'x', newText: 'y' } } }),
+    ctx
+  )
+  assert.equal(confirmCalls[0].message, 'pi-acp:toolcall=tc-1\nEdit src/a.ts (1 edit)')
+})
+
+test('pi-permission-gate: passes a timeout ceiling so an unanswered confirm cannot wedge', async () => {
+  const { handler, confirmCalls, ctx } = loadGate(async () => true)
+  await handler!(toolCall({ toolName: 'edit' }), ctx)
+  // pi only wires abort/timeout into its confirm when options are passed; without
+  // them a never-answering client would hang the tool forever.
+  assert.deepEqual(confirmCalls[0].options, { timeout: 300_000 })
 })
 
 test('pi-permission-gate: blocks the tool with the ACP reason when the user rejects', async () => {

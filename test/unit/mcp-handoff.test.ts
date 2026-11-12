@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import bridge from '../../src/acp/pi-mcp-bridge.js'
@@ -185,3 +185,101 @@ test('bridge reports a missing handoff file clearly', () => {
 test('mcpBridgePath resolves inside the repo', () => {
   assert.equal(existsSync(mcpBridgePath()), true)
 })
+
+test('toPiMcpHandoff escapes pi config templates in env and header values', () => {
+  assert.deepEqual(
+    toPiMcpHandoff([
+      {
+        name: 'probe',
+        command: '/bin/echo',
+        args: [],
+        env: [
+          { name: 'DOL', value: 'a$b!c' },
+          { name: 'HOME_LIKE', value: '${HOME}' },
+          { name: 'CMD', value: '!echo pwned' }
+        ]
+      },
+      {
+        name: 'web',
+        type: 'http',
+        url: 'https://example.com/mcp',
+        headers: [{ name: 'X-Token', value: 'tok$en' }]
+      }
+    ] as any),
+    [
+      {
+        name: 'probe',
+        config: {
+          command: '/bin/echo',
+          args: [],
+          env: { DOL: 'a$$b!c', HOME_LIKE: '$${HOME}', CMD: '$!echo pwned' }
+        }
+      },
+      {
+        name: 'web',
+        config: { type: 'http', url: 'https://example.com/mcp', headers: { 'X-Token': 'tok$$en' } }
+      }
+    ]
+  )
+})
+
+test('pi-style template resolution of escaped values yields the original literals', () => {
+  // Reimplementation of pi's parseConfigValueTemplate for the escapes pi-acp emits
+  // ($ -> $$, leading ! -> $!), proving the handoff holds literals, not templates
+  // that pi would substitute (env) or execute (!).
+  function resolvePiTemplate(value: string, env: Record<string, string>): string {
+    let out = ''
+    for (let i = 0; i < value.length; ) {
+      const ch = value[i]
+      if (ch === '$' && value[i + 1] === '$') {
+        out += '$'
+        i += 2
+        continue
+      }
+      if (ch === '$' && value[i + 1] === '!') {
+        out += '!'
+        i += 2
+        continue
+      }
+      if (ch === '$' && value[i + 1] === '{') {
+        const end = value.indexOf('}', i + 2)
+        const name = end < 0 ? '' : value.slice(i + 2, end)
+        if (!(name in env)) throw new Error(`env ${name} not set`)
+        out += env[name]
+        i = end < 0 ? value.length : end + 1
+        continue
+      }
+      if (ch === '$') {
+        const name = /^[A-Za-z_][A-Za-z0-9_]*/.exec(value.slice(i + 1))?.[0] ?? ''
+        if (!(name in env)) throw new Error(`env ${name} not set`)
+        out += env[name]
+        i += 1 + name.length
+        continue
+      }
+      out += ch
+      i += 1
+    }
+    return out
+  }
+
+  for (const raw of ['a$b!c', '${HOME}', '!echo pwned', 'tok$en', '${HOME}/x$!y']) {
+    const written = toPiMcpHandoff([
+      { name: 'probe', command: '/bin/echo', args: [], env: [{ name: 'X', value: raw }] }
+    ] as any)
+    const writtenValue = (written[0].config as any).env.X
+    assert.equal(resolvePiTemplate(writtenValue, { HOME: '/home/test' }), raw)
+  }
+})
+
+test('handoffSpawnArgs writes the handoff 0600 and discard() unlinks it', () => {
+  const args = handoffSpawnArgs([{ name: 'probe', command: '/bin/echo', args: [], env: [] }] as any)
+  const filePath = args.env?.[MCP_SERVERS_FILE_ENV] ?? ''
+  assert.ok(filePath)
+  assert.equal(statSync(filePath).mode & 0o777, 0o600, 'handoff temp file must be 0600')
+  assert.equal(typeof args.discard, 'function')
+  args.discard?.()
+  assert.equal(existsSync(filePath), false, 'discard() must unlink the handoff file')
+  args.discard?.()
+  assert.equal(existsSync(filePath), false, 'discard() must be idempotent')
+})
+

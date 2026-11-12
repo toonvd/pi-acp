@@ -202,9 +202,9 @@ export class PiAcpAgent implements ACPAgent {
       const mcpServers = opts?.mcpServers ?? this.sessions.mcpServersFor(sessionId) ?? []
 
       const handoffExtras = handoffSpawnArgs(mcpServers)
-      const gateExtras = permissionGateSpawnArgs()
       let proc: PiRpcProcess
       try {
+        const gateExtras = permissionGateSpawnArgs()
         proc = await PiRpcProcess.spawn({
           cwd,
           sessionPath: stored.sessionFile,
@@ -213,6 +213,8 @@ export class PiAcpAgent implements ACPAgent {
           extraArgs: [...(handoffExtras.extraArgs ?? []), ...(gateExtras.extraArgs ?? [])]
         })
       } catch (e: any) {
+        // The handoff temp file holds credentials; drop it when we will not spawn.
+        handoffExtras.discard?.()
         if (e?.name === 'PiRpcSpawnError') {
           throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
         }

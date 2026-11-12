@@ -24,7 +24,7 @@ interface GateApi {
 }
 
 interface GateCtx {
-  ui?: { confirm?: (title: string, message: string) => Promise<unknown> }
+  ui?: { confirm?: (title: string, message: string, options?: { timeout?: number }) => Promise<unknown> }
 }
 
 export default function (pi: GateApi): void {
@@ -48,7 +48,13 @@ export default function (pi: GateApi): void {
       const ui = (ctx as GateCtx | undefined)?.ui
       if (typeof ui?.confirm !== 'function') return undefined
 
-      const confirmed = await ui.confirm(`Allow ${toolName}?`, buildMessage(toolName, record.input, toolCallId))
+      // Pass an explicit timeout: pi only wires abort/timeout into its confirm when
+      // options are provided, and without one a never-answering client would hang the
+      // tool forever (the adapter races the same ceiling and replies `cancelled`).
+      // pi resolves `false` on timeout, which blocks the tool call.
+      const confirmed = await ui.confirm(`Allow ${toolName}?`, buildMessage(toolName, record.input, toolCallId), {
+        timeout: 300_000
+      })
       if (confirmed === true) return undefined
       return { block: true, reason: `User rejected this ${toolName} in the ACP client` }
     } catch (err) {
@@ -86,5 +92,9 @@ function editCount(record: { edits?: unknown } | null | undefined): number {
       edits = undefined
     }
   }
-  return Array.isArray(edits) ? edits.length : 0
+  // pi normalizes a single edit object into a one-element array; count it as one.
+  if (Array.isArray(edits)) return edits.length
+  const single = edits as { oldText?: unknown; newText?: unknown } | null | undefined
+  if (typeof single?.oldText === 'string' && typeof single?.newText === 'string') return 1
+  return 0
 }

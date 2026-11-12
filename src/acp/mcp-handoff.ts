@@ -1,5 +1,5 @@
 import { RequestError, type McpServer } from '@agentclientprotocol/sdk'
-import { existsSync, writeFileSync } from 'node:fs'
+import { existsSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -68,14 +68,14 @@ export function toPiMcpHandoff(servers: McpServer[]): McpHandoffEntry[] {
         throw RequestError.invalidParams({}, `MCP server "${name}" needs a non-empty command`)
       }
       const env: Record<string, string> = {}
-      for (const entry of server.env ?? []) env[entry.name] = entry.value
+      for (const entry of server.env ?? []) env[entry.name] = escapePiTemplateLiteral(entry.value)
       entries.push({ name, config: { command: server.command, args: server.args ?? [], env } })
     } else if (server.type === 'http') {
       if (!parseHttpUrl(server.url)) {
         throw RequestError.invalidParams({}, `MCP server "${name}" needs an http or https url`)
       }
       const headers: Record<string, string> = {}
-      for (const entry of server.headers ?? []) headers[entry.name] = entry.value
+      for (const entry of server.headers ?? []) headers[entry.name] = escapePiTemplateLiteral(entry.value)
       entries.push({ name, config: { type: 'http', url: server.url, headers } })
     } else {
       throw RequestError.invalidParams(
@@ -95,6 +95,21 @@ export function toPiMcpHandoff(servers: McpServer[]): McpHandoffEntry[] {
   return entries
 }
 
+/**
+ * pi resolves every config value as a template: leading `!` runs a shell command
+ * (spawnSync with a 10s timeout) and `$NAME`/`${NAME}` substitutes env vars (throwing
+ * when unset). ACP values are literals, so escape `$` -> `$$` and prefix a leading `!`
+ * with `$` (`!x` -> `$!x`), which pi parses back as the literal. Note pi expands `~`
+ * in command/args/cwd via expandHome (runtime.js) — that is intended literal behavior
+ * for a stdio server command and is deliberately NOT escaped.
+ */
+function escapePiTemplateLiteral(value: string): string {
+  // `$$` in a replacement string means one literal `$`, so doubling a `$` requires
+  // four: each match becomes two literal dollars (which pi parses back as one).
+  const escaped = value.replace(/\$/g, '$$$$')
+  return escaped.startsWith('!') ? `$${escaped}` : escaped
+}
+
 function parseHttpUrl(value: string): URL | null {
   try {
     const url = new URL(value)
@@ -108,17 +123,36 @@ function parseHttpUrl(value: string): URL | null {
 export function handoffSpawnArgs(servers: McpServer[]): {
   env?: Record<string, string>
   extraArgs?: string[]
+  /** Unlink the handoff temp file (it holds credentials); call on spawn failure. */
+  discard?: () => void
 } {
   const entries = toPiMcpHandoff(servers)
   if (entries.length === 0) return {}
-  // Secrets (headers/env) go in a 0600 temp file, not the child env block: env is
-  // visible to the whole process tree and is size-limited on Windows/Linux. If pi fails
-  // to spawn, the file is left behind — acceptable (rare, and no worse than an env leak).
+  // Secrets (headers/env) go in a 0600, fail-on-existing temp file, not the child env
+  // block: env is visible to the whole process tree and is size-limited on
+  // Windows/Linux. The caller must `discard()` (unlink) it when pi fails to spawn, or
+  // when building the spawn args throws after this write (e.g. missing bridge file).
   const filePath = join(tmpdir(), `pi-acp-mcp-${randomUUID()}.json`)
-  writeFileSync(filePath, JSON.stringify(entries), { mode: 0o600 })
-  return {
-    env: { [MCP_SERVERS_FILE_ENV]: filePath },
-    extraArgs: ['--extension', mcpBridgePath()]
+  writeFileSync(filePath, JSON.stringify(entries), { mode: 0o600, flag: 'wx' })
+  let discarded = false
+  const discard = () => {
+    if (discarded) return
+    discarded = true
+    try {
+      unlinkSync(filePath)
+    } catch {
+      // Already gone or unlinkable; nothing more to do.
+    }
+  }
+  try {
+    return {
+      env: { [MCP_SERVERS_FILE_ENV]: filePath },
+      extraArgs: ['--extension', mcpBridgePath()],
+      discard
+    }
+  } catch (e) {
+    discard()
+    throw e
   }
 }
 

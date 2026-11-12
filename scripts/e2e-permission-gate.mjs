@@ -38,9 +38,10 @@ const child = spawn('node', ['dist/index.js'], {
 let stdoutBuffer = ''
 let timedOut = false
 let finished = false
-let phase = 'allow' // 'allow' -> 'reject'
+let phase = 'allow' // 'allow' -> 'reject' -> 'crlf'
 let allowPermissionCount = 0
 let rejectPermissionCount = 0
+let crlfPermissionCount = 0
 let sessionId = null
 const rawPermissionRequests = []
 
@@ -132,10 +133,11 @@ function handleMessage(msg) {
   if (msg?.method === 'session/request_permission') {
     rawPermissionRequests.push(msg)
     const { diff } = verifyPermissionRequest(msg.params)
-    const decision = phase === 'allow' ? 'allow_once' : 'reject_once'
-    console.log(`[e2e] permission request #${phase === 'allow' ? allowPermissionCount + 1 : rejectPermissionCount + 1} (${phase}) -> ${decision}`)
+    const decision = phase === 'reject' ? 'reject_once' : 'allow_once'
+    console.log(`[e2e] permission request #${phase === 'allow' ? allowPermissionCount + 1 : phase === 'reject' ? rejectPermissionCount + 1 : crlfPermissionCount + 1} (${phase}) -> ${decision}`)
     if (phase === 'allow') allowPermissionCount += 1
-    else rejectPermissionCount += 1
+    else if (phase === 'reject') rejectPermissionCount += 1
+    else crlfPermissionCount += 1
     console.log(`[e2e] diff.path=${diff.path}`)
     console.log(`[e2e] diff.oldText (first 60 chars)=${diff.oldText.slice(0, 60).replace(/\n/g, '\\n')}`)
     console.log(`[e2e] diff.newText (first 60 chars)=${diff.newText.slice(0, 60).replace(/\n/g, '\\n')}`)
@@ -143,9 +145,15 @@ function handleMessage(msg) {
     if (phase === 'allow') {
       if (!diff.oldText.includes('line two')) fail('allow diff.oldText must contain "line two"')
       if (!diff.newText.includes('line two CHANGED')) fail('allow diff.newText must contain "line two CHANGED"')
-    } else {
+    } else if (phase === 'reject') {
       if (!diff.oldText.includes('line three')) fail('reject diff.oldText must contain "line three"')
       if (!diff.newText.includes('line three CHANGED')) fail('reject diff.newText must contain "line three CHANGED"')
+    } else {
+      // CRLF file: the preview must match pi's LF-normalized reconstruction, never a
+      // raw CRLF compare (which would silently show no change and hide the edit).
+      if (!diff.oldText.includes('line two')) fail('crlf diff.oldText must contain "line two"')
+      if (!diff.newText.includes('line two CRLF CHANGED')) fail('crlf diff.newText must contain "line two CRLF CHANGED"')
+      if (diff.oldText.includes('\r')) fail('crlf diff.oldText must be LF-normalized (no CR chars)')
     }
 
     send({
@@ -210,7 +218,7 @@ function handleMessage(msg) {
     return
   }
 
-  // Second turn finished (reject phase).
+  // Second turn finished (reject phase) -> rewrite as CRLF and edit again (allow).
   if (msg?.id === 4 && msg?.result) {
     setTimeout(() => {
       if (rejectPermissionCount === 0) fail('reject phase: no permission request was observed')
@@ -220,8 +228,43 @@ function handleMessage(msg) {
       if (!afterReject.includes('line two CHANGED')) fail('reject phase: earlier allow edit was lost')
       if (msg.result.stopReason === 'error') fail(`reject phase: turn errored: ${JSON.stringify(msg.result.error)}`)
 
-      console.log('[e2e] SUCCESS: allow_once edited the file; reject_once left it unchanged; both turns completed')
-      console.log(`[e2e] allow permission requests: ${allowPermissionCount}, reject permission requests: ${rejectPermissionCount}`)
+      // Switch the file to CRLF so the third turn exercises the CRLF-normalized diff path.
+      writeFileSync(targetFile, knownContent.replace(/\n/g, '\r\n'), 'utf8')
+      console.log('[e2e] rewrote gate.txt with CRLF line endings for the crlf phase')
+      phase = 'crlf'
+      send({
+        jsonrpc: '2.0',
+        id: 5,
+        method: 'session/prompt',
+        params: {
+          sessionId,
+          prompt: [
+            {
+              type: 'text',
+              text:
+                `Edit the file gate.txt in the session working directory. ` +
+                `Change ONLY the line that reads "line two" to read "line two CRLF CHANGED". ` +
+                `Do not modify any other line.`
+            }
+          ]
+        }
+      })
+    }, GRACE_MS)
+    return
+  }
+
+  // Third turn finished (crlf allow phase).
+  if (msg?.id === 5 && msg?.result) {
+    setTimeout(() => {
+      if (crlfPermissionCount === 0) fail('crlf phase: no permission request was observed')
+      const afterCrlf = readFileSync(targetFile, 'utf8')
+      console.log(`[e2e] file after crlf allow_once turn (escaped):\n${JSON.stringify(afterCrlf)}`)
+      if (!afterCrlf.includes('line two CRLF CHANGED')) fail('crlf phase: file was NOT edited after allow_once')
+      if (!afterCrlf.includes('\r\n')) fail('crlf phase: file lost its CRLF line endings')
+      if (msg.result.stopReason === 'error') fail(`crlf phase: turn errored: ${JSON.stringify(msg.result.error)}`)
+
+      console.log('[e2e] SUCCESS: allow_once edited the file; reject_once left it unchanged; CRLF diff + edit landed; all turns completed')
+      console.log(`[e2e] permission requests: allow=${allowPermissionCount} reject=${rejectPermissionCount} crlf=${crlfPermissionCount}`)
       console.log(`[e2e] raw permission request JSON (first allow):\n${JSON.stringify(rawPermissionRequests[0], null, 2)}`)
       finished = true
       clearTimeout(timer)
