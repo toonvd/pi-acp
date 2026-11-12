@@ -18,7 +18,6 @@ Expect some minor breaking changes.
   - Relative file paths from pi are resolved against the session cwd before being emitted as ACP tool locations, which enables follow-along features in clients like Zed
   - For `edit`, `pi-acp` attempts to infer a 1-based line number from a unique `oldText` match in the pre-edit file snapshot and includes it in the emitted tool location when possible
   - For `edit`, `pi-acp` snapshots the file before the tool runs and emits an ACP **structured diff** (`oldText`/`newText`) on completion when possible
-- **Permission gate for `edit`/`write` (default on)**: before a mutating tool executes, pi asks the ACP client to approve/reject via `session/request_permission` with `Allow`/`Reject` options. The request carries the already-emitted tool card (`toolCallId`, kind, locations, rawInput) plus a **full-file diff preview** (`oldText`/`newText`), so the client shows exactly what will change before it happens. Only top-level calls are gated — child calls made by other tools (e.g. subagent fan-out) are skipped so parallel work does not serialize into a prompt storm. Disable with `PI_ACP_PERMISSION_GATE=0`.
 - Session persistence
   - pi stores its own sessions in `~/.pi/agent/sessions/...`
   - `pi-acp` stores a small mapping file at `~/.pi/pi-acp/session-map.json` so `session/load` can reattach to a previous pi session file
@@ -119,7 +118,6 @@ Point your ACP client to the built `dist/index.js`:
 - `PI_ACP_ENABLE_EMBEDDED_CONTEXT=true` advertises ACP `promptCapabilities.embeddedContext` support to the client.
 - Default: unset/any other value means `false`.
 - When disabled, compliant ACP clients should avoid sending embedded `resource` blocks. If they send them anyway, `pi-acp` still degrades gracefully by converting them into plain-text prompt context.
-- `PI_ACP_PERMISSION_GATE=0` disables the `edit`/`write` permission gate (see [Features](#features)). Default: unset → the gate is enabled.
 
 You can add the environment variable in the Zed settings with:
 
@@ -201,7 +199,6 @@ Project layout:
 ## Limitations
 
 - No ACP filesystem delegation (`fs/*`) and no ACP terminal delegation (`terminal/*`). pi reads/writes and executes locally.
-- The permission gate only covers `edit` and `write`. `bash` (execute) and other tools run without an approve/reject prompt.
 - MCP servers from ACP params mount on the pi process through a bundled `--extension` bridge (stdio and HTTP transports; SSE/ACP-transport elements refuse the session). Server names must match `[A-Za-z0-9_-]` and be unique; names that differ only in `-`/`_` are refused too, because pi maps every server to a `mcp__<name>` namespace (with `-` → `_`), so `a-b` and `a_b` would collide. One bad element refuses the whole `session/new` rather than silently dropping some servers. Servers are exposed with `exposure: 'direct'` so the model sees their tools — this costs startup time (every server is launched and enumerated) and context tokens (their tool schemas are always loaded), so prefer few, purpose-built servers. If the user has an entry with the same name in their own `mcp.json`, pi silently gives the user's server precedence over the client-supplied one (including its `exposure`), so a client-supplied server can be shadowed without error. The session/new handoff travels in a 0600 temp file (`PI_ACP_MCP_SERVERS_FILE`) rather than the env block.
 - Assistant streaming is currently sent as `agent_message_chunk` (no separate thought stream).
 - Queue is implemented client-side and should work like pi's `one-at-a-time`

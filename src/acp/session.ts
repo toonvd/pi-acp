@@ -6,7 +6,6 @@ import type {
   SessionUpdate,
   ToolCallContent,
   ToolCallLocation,
-  ToolCallUpdate,
   ToolKind
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
@@ -21,7 +20,7 @@ import {
 } from '../pi-rpc/process.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { SessionStore } from './session-store.js'
-import { handoffSpawnArgs, permissionGateSpawnArgs } from './mcp-handoff.js'
+import { handoffSpawnArgs } from './mcp-handoff.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import {
   bashCommand,
@@ -68,19 +67,6 @@ const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
 ]
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
-const PERMISSION_CONFIRM_TIMEOUT_ENV = 'PI_ACP_PERMISSION_CONFIRM_TIMEOUT_MS'
-const DEFAULT_PERMISSION_CONFIRM_TIMEOUT_MS = 300_000
-
-/**
- * Ceiling for a permission confirm the client never answers. Matches the timeout the
- * gate passes to pi's `ui.confirm`, so both sides resolve `false`/cancelled together
- * instead of wedging the turn. Overridable for tests via
- * `PI_ACP_PERMISSION_CONFIRM_TIMEOUT_MS` (read lazily so tests can shorten it).
- */
-function permissionConfirmTimeoutMs(): number {
-  const raw = Number(process.env[PERMISSION_CONFIRM_TIMEOUT_ENV])
-  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_PERMISSION_CONFIRM_TIMEOUT_MS
-}
 
 /**
  * Map pi's `stats.contextUsage` to an ACP `usage_update`. Returns null whenever pi
@@ -121,38 +107,31 @@ function getToolPath(args: unknown): string | undefined {
 }
 
 // Match pi's current edit schema: { path, edits: [{ oldText, newText }] }, with
-// legacy top-level oldText/newText still accepted. Pi also normalizes stringified
-// edits and a single edit object into a one-element array.
+// legacy top-level oldText/newText still accepted. Pi also normalizes stringified edits.
 // https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/tools/edit.ts
-function isSingleEdit(value: unknown): value is { oldText: string; newText: string } {
-  const edit = value as { oldText?: unknown; newText?: unknown } | null | undefined
-  return typeof edit?.oldText === 'string' && typeof edit?.newText === 'string'
-}
-
 function getParsedEdits(args: unknown): Array<{ oldText: string; newText: string }> {
   const record = args as { oldText?: unknown; newText?: unknown; edits?: unknown } | null | undefined
   const parsed: Array<{ oldText: string; newText: string }> = []
 
-  if (isSingleEdit(record)) {
+  if (typeof record?.oldText === 'string' && typeof record?.newText === 'string') {
     parsed.push({ oldText: record.oldText, newText: record.newText })
   }
 
   let edits = record?.edits
   if (typeof edits === 'string') {
     try {
-      const parsedEdits = JSON.parse(edits) as unknown
-      // Stringified edits may be an array or a single edit object; pi accepts both.
-      edits = Array.isArray(parsedEdits) ? parsedEdits : isSingleEdit(parsedEdits) ? [parsedEdits] : undefined
+      edits = JSON.parse(edits) as unknown
     } catch {
       edits = undefined
     }
   }
 
-  if (isSingleEdit(edits)) {
-    parsed.push({ oldText: edits.oldText, newText: edits.newText })
-  } else if (Array.isArray(edits)) {
+  if (Array.isArray(edits)) {
     for (const edit of edits) {
-      if (isSingleEdit(edit)) parsed.push({ oldText: edit.oldText, newText: edit.newText })
+      const item = edit as { oldText?: unknown; newText?: unknown } | null | undefined
+      if (typeof item?.oldText === 'string' && typeof item?.newText === 'string') {
+        parsed.push({ oldText: item.oldText, newText: item.newText })
+      }
     }
   }
 
@@ -168,16 +147,13 @@ function getEditOldTexts(args: unknown): string[] {
   let edits = record?.edits
   if (typeof edits === 'string') {
     try {
-      const parsedEdits = JSON.parse(edits) as unknown
-      edits = Array.isArray(parsedEdits) ? parsedEdits : isSingleEdit(parsedEdits) ? [parsedEdits] : undefined
+      edits = JSON.parse(edits) as unknown
     } catch {
       edits = undefined
     }
   }
 
-  if (isSingleEdit(edits)) {
-    if (!oldTexts.includes(edits.oldText)) oldTexts.push(edits.oldText)
-  } else if (Array.isArray(edits)) {
+  if (Array.isArray(edits)) {
     for (const edit of edits) {
       const oldText = (edit as { oldText?: unknown } | null | undefined)?.oldText
       if (typeof oldText === 'string' && !oldTexts.includes(oldText)) oldTexts.push(oldText)
@@ -193,138 +169,6 @@ function toToolCallLocations(args: unknown, cwd: string, line?: number): ToolCal
 
   const resolvedPath = isAbsolute(path) ? path : resolvePath(cwd, path)
   return [{ path: resolvedPath, ...(typeof line === 'number' ? { line } : {}) }]
-}
-
-/**
- * Extract the toolCallId from a permission-gate confirm message. The gate extension
- * puts `pi-acp:toolcall=<toolCallId>` on its OWN FIRST LINE so the adapter can
- * correlate the prompt with the real tool card. Only a marker on the first line
- * counts: a `\npi-acp:toolcall=...` embedded in a file path (or any later line)
- * must never hijack the correlation. Returns null when the first line has no marker.
- */
-function permissionGateToolCallIdFromMessage(ev: PiRpcEvent): string | null {
-  const message = stringProp(ev, 'message')
-  if (!message) return null
-  const firstLine = message.split('\n', 1)[0]
-  const match = firstLine.match(/^pi-acp:toolcall=(.+)$/)
-  const id = match?.[1]
-  return typeof id === 'string' && id ? id : null
-}
-
-/** 1-based line of a unique oldText match, for the permission card location. */
-function editToolLine(oldText: string | null | undefined, args: unknown): number | undefined {
-  if (typeof oldText !== 'string') return undefined
-  for (const needle of getEditOldTexts(args)) {
-    const line = findUniqueLineNumber(oldText, needle)
-    if (typeof line === 'number') return line
-  }
-  return undefined
-}
-
-/**
- * Full-file diff preview for the permission-gate card. For `write`, oldText is the
- * pre-write snapshot (or '' for a new file) and newText is the `content` arg. For
- * `edit`, newText reconstructs the requested edits against the pre-edit snapshot the
- * way pi will apply them. Returns undefined when the diff cannot be computed, and
- * degrades to a plain-text card whenever a derived diff could disagree with pi.
- */
-function toPermissionGateDiff(
-  toolName: string,
-  args: unknown,
-  cwd: string,
-  snapshot: { path: string; oldText: string | null } | undefined
-): ToolCallContent | undefined {
-  const path = getToolPath(args)
-  if (!path) return undefined
-  const abs = isAbsolute(path) ? path : resolvePath(cwd, path)
-
-  if (toolName === 'write') {
-    const newText = (args as { content?: unknown } | null | undefined)?.content
-    if (typeof newText !== 'string') return undefined
-    const oldText = snapshot?.oldText ?? ''
-    // Never preview a diff whose newText equals oldText: approving an apparent no-op
-    // card while pi still writes would be a trust violation.
-    if (newText === oldText) return editFallbackContent(toolName, args, abs)
-    return { type: 'diff', path: abs, oldText, newText }
-  }
-
-  const oldText = snapshot?.oldText
-  if (typeof oldText !== 'string') return undefined
-  const edits = getParsedEdits(args)
-  if (edits.length === 0) return undefined
-  const rebuilt = applyEditsExact(oldText, edits)
-  if (rebuilt === null) return editFallbackContent(toolName, args, abs)
-  return { type: 'diff', path: abs, oldText: rebuilt.oldText, newText: rebuilt.newText }
-}
-
-/**
- * Reconstruct what pi will actually write, mirroring pi 1.3.0's edit-diff:
- * strip a leading BOM, normalize CRLF->LF on the snapshot and on both
- * oldText/newText, match EVERY oldText against the ORIGINAL (never progressively),
- * require unique + non-overlapping matches, then apply right-to-left so offsets stay
- * stable. Returns null when any edit would fail (missing, duplicated, overlapping) or
- * the result would be identical to the input, so the caller degrades to a text card
- * instead of previewing something pi would not do.
- */
-function applyEditsExact(
-  source: string,
-  edits: Array<{ oldText: string; newText: string }>
-): { oldText: string; newText: string } | null {
-  const norm = source.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-  const normalized = edits.map(edit => ({
-    oldText: edit.oldText.replace(/\r\n/g, '\n').replace(/\r/g, '\n'),
-    newText: edit.newText.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-  }))
-
-  // Fuzzy matches (whitespace/quotes/dashes/NBSP) deliberately degrade to the text fallback.
-  const matches: Array<{ index: number; oldText: string; newText: string }> = []
-  for (const edit of normalized) {
-    if (!edit.oldText) return null
-    const index = norm.indexOf(edit.oldText)
-    if (index < 0) return null
-    let occurrences = 0
-    for (let from = 0; ; ) {
-      const at = norm.indexOf(edit.oldText, from)
-      if (at < 0) break
-      occurrences += 1
-      from = at + edit.oldText.length
-    }
-    if (occurrences > 1) return null
-    matches.push({ index, oldText: edit.oldText, newText: edit.newText })
-  }
-
-  matches.sort((a, b) => a.index - b.index)
-  for (let i = 1; i < matches.length; i += 1) {
-    const prev = matches[i - 1]
-    if (prev.index + prev.oldText.length > matches[i].index) return null
-  }
-
-  let out = norm
-  for (const match of [...matches].reverse()) {
-    out = out.slice(0, match.index) + match.newText + out.slice(match.index + match.oldText.length)
-  }
-  if (out === norm) return null
-  return { oldText: norm, newText: out }
-}
-
-/**
- * Text-only permission card used whenever a derived diff would be unreliable (missing,
- * duplicated, or overlapping edit matches, fuzzy-only matches, or a no-op write). Shows
- * exactly what the model asked for instead of a reconstruction pi would not perform.
- */
-function editFallbackContent(toolName: string, args: unknown, abs: string): ToolCallContent {
-  const path = getToolPath(args) ?? abs
-  const lines = [`pi ${toolName}: ${path}`]
-  if (toolName === 'write') {
-    const newText = (args as { content?: unknown } | null | undefined)?.content
-    lines.push(`newText: ${JSON.stringify(typeof newText === 'string' ? newText : '')}`)
-  } else {
-    for (const [i, edit] of getParsedEdits(args).entries()) {
-      lines.push(`${i + 1}. oldText: ${JSON.stringify(edit.oldText)}`)
-      lines.push(`   newText: ${JSON.stringify(edit.newText)}`)
-    }
-  }
-  return { type: 'content', content: { type: 'text', text: lines.join('\n') } }
 }
 
 export class SessionManager {
@@ -398,12 +242,10 @@ export class SessionManager {
     const handoffExtras = handoffSpawnArgs(params.mcpServers)
     let proc: PiRpcProcess
     try {
-      const gateExtras = permissionGateSpawnArgs()
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
         piCommand: params.piCommand,
-        ...handoffExtras,
-        extraArgs: [...(handoffExtras.extraArgs ?? []), ...(gateExtras.extraArgs ?? [])]
+        ...handoffExtras
       })
     } catch (e) {
       // The handoff temp file holds credentials; drop it when we will not spawn.
@@ -512,11 +354,6 @@ export class PiAcpSession {
   private fileMutationToolCallIds = new Set<string>()
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
-
-  // Tool name + args per toolCallId, remembered at tool_execution_start so a
-  // permission-gate confirm can rebuild the REAL tool card (with a full-file diff)
-  // instead of the synthetic `pi-ui-<id>` card.
-  private toolCallArgs = new Map<string, { toolName: string; args: unknown }>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -795,7 +632,6 @@ export class PiAcpSession {
     this.fileMutationToolCallIds.delete(toolCallId)
     this.bashToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
-    this.toolCallArgs.delete(toolCallId)
   }
 
   private startTurn(t: QueuedTurn): void {
@@ -972,7 +808,6 @@ export class PiAcpSession {
         }
 
         // Capture pre-mutation file contents so we can emit a structured ACP diff.
-        this.toolCallArgs.set(toolCallId, { toolName, args })
         const isFileMutation = toolName === 'edit' || toolName === 'write'
         let snapshotOldText: string | null | undefined
         if (isFileMutation) {
@@ -1269,105 +1104,33 @@ export class PiAcpSession {
   }
 
   private async handleExtensionConfirm(ev: PiRpcEvent, id: string): Promise<void> {
-    // A confirm whose message carries the permission-gate marker (`pi-acp:toolcall=<id>`)
-    // maps to the REAL tool card with a full-file diff; every other confirm keeps the
-    // generic pi-extension UI behavior.
-    const gateToolCallId = permissionGateToolCallIdFromMessage(ev)
-    const isGate = gateToolCallId !== null
-
-    const options: PermissionOption[] = isGate
-      ? [
-          { optionId: 'allow_once', name: 'Allow', kind: 'allow_once' },
-          { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' }
-        ]
-      : CONFIRM_PERMISSION_OPTIONS
-
-    const selected = await this.requestExtensionPermission(
-      id,
-      ev,
-      options,
-      isGate ? this.permissionGateToolCall(gateToolCallId, ev) : undefined
-    )
+    const selected = await this.requestExtensionPermission(id, ev, CONFIRM_PERMISSION_OPTIONS)
     if (selected === null) {
       return
     }
 
     if (selected.outcome.outcome === 'cancelled') {
-      if (isGate) {
-        // The gate resolves `false` on cancel (reject), so reply confirmed:false.
-        await this.proc.sendExtensionUiResponse({ id, confirmed: false })
-      } else {
-        await this.proc.sendExtensionUiResponse({ id, cancelled: true })
-      }
-      return
-    }
-
-    if (isGate) {
-      await this.proc.sendExtensionUiResponse({ id, confirmed: selected.outcome.optionId === 'allow_once' })
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
       return
     }
 
     await this.proc.sendExtensionUiResponse({ id, confirmed: selected.outcome.optionId === 'yes' })
   }
 
-  /**
-   * Rebuild the real ACP tool card for a permission-gate confirm: same toolCallId as
-   * the already-emitted tool card, with locations + rawInput + a full-file diff
-   * preview. Falls back to the synthetic `pi-ui-<id>` card when the tool call was
-   * never correlated (no remembered args) — never throws.
-   */
-  private permissionGateToolCall(toolCallId: string, ev: PiRpcEvent): ToolCallUpdate {
-    const remembered = this.toolCallArgs.get(toolCallId)
-    if (!remembered) {
-      return extensionUiToolCall(stringProp(ev, 'id') ?? toolCallId, ev)
-    }
-
-    const { toolName, args } = remembered
-    const snapshot = this.fileSnapshots.get(toolCallId)
-    const locations = toToolCallLocations(args, this.cwd, editToolLine(snapshot?.oldText, args))
-    const diff = toPermissionGateDiff(toolName, args, this.cwd, snapshot)
-
-    return {
-      toolCallId,
-      title: toolCallTitle(toolName, args),
-      kind: toToolKind(toolName),
-      status: 'in_progress' as const,
-      ...(locations ? { locations } : {}),
-      rawInput: args,
-      ...(diff ? { content: [diff] } : {})
-    }
-  }
-
   private async requestExtensionPermission(
     id: string,
     ev: PiRpcEvent,
-    options: PermissionOption[],
-    toolCall?: ToolCallUpdate
+    options: PermissionOption[]
   ): Promise<PermissionResponse | null> {
-    const request = this.conn.requestPermission({
-      sessionId: this.sessionId,
-      toolCall: toolCall ?? extensionUiToolCall(id, ev),
-      options
-    })
-
-    // If the client never answers, reply `cancelled` after the same ceiling pi applies
-    // to its confirm, so the gate resolves `false` (reject) instead of wedging the
-    // tool, the turn, and every queued prompt.
-    let fallbackTimer: ReturnType<typeof setTimeout> | undefined
-    fallbackTimer = setTimeout(() => {
-      fallbackTimer = undefined
-      void this.proc.sendExtensionUiResponse({ id, cancelled: true }).catch(() => {})
-    }, permissionConfirmTimeoutMs())
-
     try {
-      return await request
+      return await this.conn.requestPermission({
+        sessionId: this.sessionId,
+        toolCall: extensionUiToolCall(id, ev),
+        options
+      })
     } catch {
-      if (fallbackTimer !== undefined) clearTimeout(fallbackTimer)
       await this.proc.sendExtensionUiResponse({ id, cancelled: true })
       return null
-    } finally {
-      // Clear on normal resolution so no timer keeps the process alive.
-      if (fallbackTimer !== undefined) clearTimeout(fallbackTimer)
     }
   }
 }

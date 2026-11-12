@@ -26,7 +26,7 @@ import {
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
-import { handoffSpawnArgs, permissionGateSpawnArgs } from './mcp-handoff.js'
+import { handoffSpawnArgs } from './mcp-handoff.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSession, readPiSessionTitle } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
@@ -204,13 +204,11 @@ export class PiAcpAgent implements ACPAgent {
       const handoffExtras = handoffSpawnArgs(mcpServers)
       let proc: PiRpcProcess
       try {
-        const gateExtras = permissionGateSpawnArgs()
         proc = await PiRpcProcess.spawn({
           cwd,
           sessionPath: stored.sessionFile,
           piCommand: process.env.PI_ACP_PI_COMMAND,
-          ...handoffExtras,
-          extraArgs: [...(handoffExtras.extraArgs ?? []), ...(gateExtras.extraArgs ?? [])]
+          ...handoffExtras
         })
       } catch (e: any) {
         // The handoff temp file holds credentials; drop it when we will not spawn.

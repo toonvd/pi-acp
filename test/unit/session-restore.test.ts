@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
-import { MCP_SERVERS_FILE_ENV, permissionGatePath } from '../../src/acp/mcp-handoff.js'
+import { MCP_SERVERS_FILE_ENV } from '../../src/acp/mcp-handoff.js'
 import { SessionManager } from '../../src/acp/session.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
@@ -86,8 +86,7 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
       {
         cwd: '/tmp/store-project',
         sessionPath: '/tmp/store-project/session.jsonl',
-        piCommand: process.env.PI_ACP_PI_COMMAND,
-        extraArgs: ['--extension', permissionGatePath()]
+        piCommand: process.env.PI_ACP_PI_COMMAND
       }
     ])
     assert.deepEqual(promptCalls, [{ message: 'hello again', images: [] }])
@@ -184,8 +183,7 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
       {
         cwd: '/tmp/fallback-project',
         sessionPath: sessionFile,
-        piCommand: process.env.PI_ACP_PI_COMMAND,
-        extraArgs: ['--extension', permissionGatePath()]
+        piCommand: process.env.PI_ACP_PI_COMMAND
       }
     ])
     assert.deepEqual(setModelCalls, [{ provider: 'test', modelId: 'beta' }])
