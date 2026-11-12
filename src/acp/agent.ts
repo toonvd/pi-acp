@@ -196,7 +196,12 @@ export class PiAcpAgent implements ACPAgent {
 
       const cwd = opts?.cwd ?? stored.cwd
 
-      const handoffExtras = handoffSpawnArgs(opts?.mcpServers ?? [])
+      // MCP servers travel with the pi subprocess, so a respawn (chat switch + come
+      // back) must re-mount what the client originally handed us. An explicit [] from
+      // the client still wins over the remembered list.
+      const mcpServers = opts?.mcpServers ?? this.sessions.mcpServersFor(sessionId) ?? []
+
+      const handoffExtras = handoffSpawnArgs(mcpServers)
       let proc: PiRpcProcess
       try {
         proc = await PiRpcProcess.spawn({
@@ -215,7 +220,7 @@ export class PiAcpAgent implements ACPAgent {
       const fileCommands = loadSlashCommands(cwd)
       const session = this.sessions.getOrCreate(sessionId, {
         cwd,
-        mcpServers: opts?.mcpServers ?? [],
+        mcpServers,
         conn: this.conn,
         proc,
         fileCommands
@@ -258,7 +263,9 @@ export class PiAcpAgent implements ACPAgent {
       }),
       agentCapabilities: {
         loadSession: true,
-        mcpCapabilities: { http: false, sse: false },
+        // HTTP MCP servers mount on the pi process through the bundled bridge;
+        // SSE transport is refused up front (toPiMcpHandoff).
+        mcpCapabilities: { http: true, sse: false },
         promptCapabilities: {
           image: true,
           audio: false,
@@ -1144,6 +1151,9 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     this.store.delete(params.sessionId)
+    // Forget the session entirely: close its live pi process and drop the remembered
+    // MCP servers (which are not persisted anywhere else).
+    this.sessions.delete(params.sessionId)
 
     return {}
   }

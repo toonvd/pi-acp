@@ -174,10 +174,19 @@ function toToolCallLocations(args: unknown, cwd: string, line?: number): ToolCal
 export class SessionManager {
   private sessions = new Map<string, PiAcpSession>()
   private readonly store = new SessionStore()
+  // MCP servers the client mounted on a session, kept across pi subprocess respawns
+  // (close -> restore) so restoreSession can re-mount them. Not persisted to the
+  // session map file: it can contain credentials.
+  private readonly mcpServersBySession = new Map<string, McpServer[]>()
 
   /** Dispose all sessions and their underlying pi subprocesses. */
   disposeAll(): void {
     for (const [id] of this.sessions) this.close(id)
+  }
+
+  /** MCP servers remembered for a session (undefined when never mounted / deleted). */
+  mcpServersFor(sessionId: string): McpServer[] | undefined {
+    return this.mcpServersBySession.get(sessionId)
   }
 
   /** Get a registered session if it exists (no throw). */
@@ -198,6 +207,15 @@ export class SessionManager {
       // ignore
     }
     this.sessions.delete(sessionId)
+  }
+
+  /**
+   * Forget a session entirely (session/delete): closes it and drops the remembered
+   * MCP servers. Plain `close` keeps the servers so restoreSession can re-mount them.
+   */
+  delete(sessionId: string): void {
+    this.close(sessionId)
+    this.mcpServersBySession.delete(sessionId)
   }
 
   /** Close all sessions except the one with `keepSessionId`. */
@@ -254,6 +272,7 @@ export class SessionManager {
     })
 
     this.sessions.set(sessionId, session)
+    this.mcpServersBySession.set(sessionId, params.mcpServers)
     return session
   }
 
@@ -282,6 +301,7 @@ export class SessionManager {
     })
 
     this.sessions.set(sessionId, session)
+    this.mcpServersBySession.set(sessionId, params.mcpServers)
     return session
   }
 }
@@ -552,8 +572,13 @@ export class PiAcpSession {
     status: 'pending' | 'in_progress'
     locations?: ToolCallLocation[]
     includeTerminal: boolean
+    parentToolCallId?: string
   }): void {
     this.bashToolCallIds.add(params.toolCallId)
+    const meta = {
+      ...(params.includeTerminal ? bashTerminalInfoMeta(params.toolCallId, this.cwd) : {}),
+      ...(params.parentToolCallId ? { parentToolCallId: params.parentToolCallId } : {})
+    }
     this.emit({
       sessionUpdate: params.sessionUpdate,
       toolCallId: params.toolCallId,
@@ -562,7 +587,7 @@ export class PiAcpSession {
       status: params.status,
       locations: params.locations,
       ...(params.includeTerminal ? { content: bashTerminalContent(params.toolCallId) } : {}),
-      ...(params.includeTerminal ? { _meta: bashTerminalInfoMeta(params.toolCallId, this.cwd) } : {})
+      ...(Object.keys(meta).length ? { _meta: meta } : {})
     })
   }
 
@@ -571,6 +596,7 @@ export class PiAcpSession {
     status: 'in_progress' | 'completed' | 'failed'
     result: unknown
     isError?: boolean
+    parentToolCallId?: string
   }): void {
     const text = bashResultText(params.result)
     const previous = this.bashOutputSnapshots.get(params.toolCallId) ?? ''
@@ -585,7 +611,8 @@ export class PiAcpSession {
         ...(delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {}),
         ...(params.status === 'completed' || params.status === 'failed'
           ? bashTerminalExitMeta(params.toolCallId, bashExitCode(params.result, Boolean(params.isError)))
-          : {})
+          : {}),
+        ...(params.parentToolCallId ? { parentToolCallId: params.parentToolCallId } : {})
       }
     })
   }
@@ -711,7 +738,8 @@ export class PiAcpSession {
                 args: rawInput,
                 status,
                 locations,
-                includeTerminal: !existingStatus
+                includeTerminal: !existingStatus,
+                parentToolCallId: (ev as any)?.parentToolCallId
               })
             } else if (!existingStatus) {
               this.currentToolCalls.set(toolCallId, 'pending')
@@ -722,7 +750,8 @@ export class PiAcpSession {
                 kind: toToolKind(toolName),
                 status,
                 locations,
-                rawInput
+                rawInput,
+                ...parentToolCallMeta(ev)
               })
             } else {
               // Best-effort: keep rawInput updated while args are streaming.
@@ -732,7 +761,9 @@ export class PiAcpSession {
                 toolCallId,
                 status,
                 locations,
-                rawInput
+                rawInput,
+                title: toolCallTitle(toolName, rawInput),
+                ...parentToolCallMeta(ev)
               })
             }
           }
@@ -761,7 +792,8 @@ export class PiAcpSession {
             args,
             status: 'in_progress',
             locations,
-            includeTerminal: !existingStatus
+            includeTerminal: !existingStatus,
+            parentToolCallId: (ev as any)?.parentToolCallId
           })
           break
         }
@@ -818,6 +850,7 @@ export class PiAcpSession {
             status: 'in_progress',
             locations,
             rawInput: args,
+            title: toolCallTitle(toolName, args),
             ...parentMeta
           })
         }
@@ -831,7 +864,12 @@ export class PiAcpSession {
 
         const partial = (ev as any).partialResult
         if (this.bashToolCallIds.has(toolCallId)) {
-          this.emitBashOutputUpdate({ toolCallId, status: 'in_progress', result: partial })
+          this.emitBashOutputUpdate({
+            toolCallId,
+            status: 'in_progress',
+            result: partial,
+            parentToolCallId: (ev as any)?.parentToolCallId
+          })
           break
         }
 
@@ -861,7 +899,8 @@ export class PiAcpSession {
             toolCallId,
             status: isError ? 'failed' : 'completed',
             result,
-            isError
+            isError,
+            parentToolCallId: (ev as any)?.parentToolCallId
           })
           this.cleanupToolCall(toolCallId)
           break

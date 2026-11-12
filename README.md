@@ -199,7 +199,7 @@ Project layout:
 ## Limitations
 
 - No ACP filesystem delegation (`fs/*`) and no ACP terminal delegation (`terminal/*`). pi reads/writes and executes locally.
-- MCP servers from ACP params mount on the pi process through a bundled `--extension` bridge (stdio and HTTP transports; SSE/ACP-transport elements refuse the session).
+- MCP servers from ACP params mount on the pi process through a bundled `--extension` bridge (stdio and HTTP transports; SSE/ACP-transport elements refuse the session). Servers are exposed with `exposure: 'direct'` so the model sees their tools, and the session/new handoff travels in a 0600 temp file (`PI_ACP_MCP_SERVERS_FILE`) rather than the env block.
 - Assistant streaming is currently sent as `agent_message_chunk` (no separate thought stream).
 - Queue is implemented client-side and should work like pi's `one-at-a-time`
 - ~~ACP clients don't yet suport session history, but ACP sessions from `pi-acp` can be `/resume`d in pi directly~~
