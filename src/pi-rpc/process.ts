@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import * as readline from 'node:readline'
 import crossSpawn from 'cross-spawn'
+import { RequestError } from '@agentclientprotocol/sdk'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
 
 export class PiRpcSpawnError extends Error {
@@ -73,6 +74,9 @@ export type PiRpcEvent = Record<string, unknown>
 /** Maximum wait for an auxiliary context-usage update. */
 export const SESSION_STATS_TIMEOUT_MS = 1_000
 
+/** How much of the child's stderr to keep for surfacing startup failures. */
+const STDERR_TAIL_MAX_BYTES = 8 * 1024
+
 /**
  * Shape of `stats.contextUsage` in pi's `get_session_stats` response.
  * `tokens` is null while pi has no trustworthy token count (e.g. right after compaction).
@@ -114,9 +118,15 @@ export class PiRpcProcess {
   private readonly pending = new Map<string, { resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }>()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
   private readonly preludeLines: string[] = []
+  /** Last ~8 KiB of the child's stderr; surfaced when the RPC handshake fails. */
+  private stderrTail = ''
 
   private constructor(child: ChildProcessWithoutNullStreams) {
     this.child = child
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      this.stderrTail = (this.stderrTail + chunk.toString('utf8')).slice(-STDERR_TAIL_MAX_BYTES)
+    })
 
     const rl = readline.createInterface({ input: child.stdout })
     rl.on('line', line => {
@@ -210,10 +220,6 @@ export class PiRpcProcess {
       throw new PiRpcSpawnError(`Could not start pi (command: ${cmd}).`, { code, cause: e })
     }
 
-    child.stderr.on('data', () => {
-      // leave stderr untouched; ACP clients may capture it.
-    })
-
     const proc = new PiRpcProcess(child)
 
     // Best-effort handshake.
@@ -229,7 +235,13 @@ export class PiRpcProcess {
         mkdirSync(dirname(sessionFile), { recursive: true })
       }
     } catch {
-      // ignore for now
+      // A broken extension bundle or config can make pi die (or never answer) before the
+      // handshake. Fail loudly with pi's stderr tail instead of returning a dead
+      // subprocess whose first prompt reports stopReason:'error' with no reason.
+      proc.dispose()
+      const tail = proc.stderrTailText()
+      const detail = tail ? ` pi stderr:\n${tail}` : ''
+      throw RequestError.internalError({}, `pi exited before the RPC handshake completed.${detail}`)
     }
 
     return proc
@@ -258,6 +270,11 @@ export class PiRpcProcess {
   consumePreludeLines(): string[] {
     const lines = this.preludeLines.splice(0, this.preludeLines.length)
     return lines
+  }
+
+  /** Last ~8 KiB of the child's stderr; useful when pi dies during startup. */
+  stderrTailText(): string {
+    return this.stderrTail
   }
 
   async prompt(message: string, images: unknown[] = []): Promise<void> {
