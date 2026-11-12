@@ -6,6 +6,7 @@ import type {
   SessionUpdate,
   ToolCallContent,
   ToolCallLocation,
+  ToolCallUpdate,
   ToolKind
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
@@ -20,7 +21,7 @@ import {
 } from '../pi-rpc/process.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { SessionStore } from './session-store.js'
-import { handoffSpawnArgs } from './mcp-handoff.js'
+import { handoffSpawnArgs, permissionGateSpawnArgs } from './mcp-handoff.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import {
   bashCommand,
@@ -171,6 +172,74 @@ function toToolCallLocations(args: unknown, cwd: string, line?: number): ToolCal
   return [{ path: resolvedPath, ...(typeof line === 'number' ? { line } : {}) }]
 }
 
+/**
+ * Extract the toolCallId from a permission-gate confirm message. The gate extension
+ * puts `pi-acp:toolcall=<toolCallId>` on its own line so the adapter can correlate
+ * the prompt with the real tool card. Returns null when the marker is absent.
+ */
+function permissionGateToolCallIdFromMessage(ev: PiRpcEvent): string | null {
+  const message = stringProp(ev, 'message')
+  if (!message) return null
+  const match = message.match(/^pi-acp:toolcall=(.+)$/m)
+  const id = match?.[1]
+  return typeof id === 'string' && id ? id : null
+}
+
+/** 1-based line of a unique oldText match, for the permission card location. */
+function editToolLine(oldText: string | null | undefined, args: unknown): number | undefined {
+  if (typeof oldText !== 'string') return undefined
+  for (const needle of getEditOldTexts(args)) {
+    const line = findUniqueLineNumber(oldText, needle)
+    if (typeof line === 'number') return line
+  }
+  return undefined
+}
+
+/**
+ * Full-file diff preview for the permission-gate card. For `write`, oldText is the
+ * pre-write snapshot (or '' for a new file) and newText is the `content` arg. For
+ * `edit`, newText applies the requested edits (sequential first-occurrence replace)
+ * to the pre-edit snapshot. Returns undefined when the diff cannot be computed.
+ */
+function toPermissionGateDiff(
+  toolName: string,
+  args: unknown,
+  cwd: string,
+  snapshot: { path: string; oldText: string | null } | undefined
+): ToolCallContent | undefined {
+  const path = getToolPath(args)
+  if (!path) return undefined
+  const abs = isAbsolute(path) ? path : resolvePath(cwd, path)
+
+  if (toolName === 'write') {
+    const newText = (args as { content?: unknown } | null | undefined)?.content
+    if (typeof newText !== 'string') return undefined
+    return { type: 'diff', path: abs, oldText: snapshot?.oldText ?? '', newText }
+  }
+
+  const oldText = snapshot?.oldText
+  if (typeof oldText !== 'string') return undefined
+  const edits = getParsedEdits(args)
+  if (edits.length === 0) return undefined
+  return { type: 'diff', path: abs, oldText, newText: applyEditsSequential(oldText, edits) }
+}
+
+/** Apply edits one at a time, replacing the first occurrence of each oldText. */
+function applyEditsSequential(
+  source: string,
+  edits: Array<{ oldText: string; newText: string }>
+): string {
+  let out = source
+  for (const edit of edits) {
+    if (!edit.oldText) continue
+    const index = out.indexOf(edit.oldText)
+    if (index >= 0) {
+      out = out.slice(0, index) + edit.newText + out.slice(index + edit.oldText.length)
+    }
+  }
+  return out
+}
+
 export class SessionManager {
   private sessions = new Map<string, PiAcpSession>()
   private readonly store = new SessionStore()
@@ -233,12 +302,14 @@ export class SessionManager {
     // Fail-closed before spawning: an unservable element refuses the session
     // instead of running one whose tools silently never arrive.
     const handoffExtras = handoffSpawnArgs(params.mcpServers)
+    const gateExtras = permissionGateSpawnArgs()
     let proc: PiRpcProcess
     try {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
         piCommand: params.piCommand,
-        ...handoffExtras
+        ...handoffExtras,
+        extraArgs: [...(handoffExtras.extraArgs ?? []), ...(gateExtras.extraArgs ?? [])]
       })
     } catch (e) {
       if (e instanceof PiRpcSpawnError) {
@@ -345,6 +416,11 @@ export class PiAcpSession {
   private fileMutationToolCallIds = new Set<string>()
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
+
+  // Tool name + args per toolCallId, remembered at tool_execution_start so a
+  // permission-gate confirm can rebuild the REAL tool card (with a full-file diff)
+  // instead of the synthetic `pi-ui-<id>` card.
+  private toolCallArgs = new Map<string, { toolName: string; args: unknown }>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -623,6 +699,7 @@ export class PiAcpSession {
     this.fileMutationToolCallIds.delete(toolCallId)
     this.bashToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
+    this.toolCallArgs.delete(toolCallId)
   }
 
   private startTurn(t: QueuedTurn): void {
@@ -799,6 +876,7 @@ export class PiAcpSession {
         }
 
         // Capture pre-mutation file contents so we can emit a structured ACP diff.
+        this.toolCallArgs.set(toolCallId, { toolName, args })
         const isFileMutation = toolName === 'edit' || toolName === 'write'
         let snapshotOldText: string | null | undefined
         if (isFileMutation) {
@@ -1095,28 +1173,85 @@ export class PiAcpSession {
   }
 
   private async handleExtensionConfirm(ev: PiRpcEvent, id: string): Promise<void> {
-    const selected = await this.requestExtensionPermission(id, ev, CONFIRM_PERMISSION_OPTIONS)
+    // A confirm whose message carries the permission-gate marker (`pi-acp:toolcall=<id>`)
+    // maps to the REAL tool card with a full-file diff; every other confirm keeps the
+    // generic pi-extension UI behavior.
+    const gateToolCallId = permissionGateToolCallIdFromMessage(ev)
+    const isGate = gateToolCallId !== null
+
+    const options: PermissionOption[] = isGate
+      ? [
+          { optionId: 'allow_once', name: 'Allow', kind: 'allow_once' },
+          { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' }
+        ]
+      : CONFIRM_PERMISSION_OPTIONS
+
+    const selected = await this.requestExtensionPermission(
+      id,
+      ev,
+      options,
+      isGate ? this.permissionGateToolCall(gateToolCallId, ev) : undefined
+    )
     if (selected === null) {
       return
     }
 
     if (selected.outcome.outcome === 'cancelled') {
-      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      if (isGate) {
+        // The gate resolves `false` on cancel (reject), so reply confirmed:false.
+        await this.proc.sendExtensionUiResponse({ id, confirmed: false })
+      } else {
+        await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      }
+      return
+    }
+
+    if (isGate) {
+      await this.proc.sendExtensionUiResponse({ id, confirmed: selected.outcome.optionId === 'allow_once' })
       return
     }
 
     await this.proc.sendExtensionUiResponse({ id, confirmed: selected.outcome.optionId === 'yes' })
   }
 
+  /**
+   * Rebuild the real ACP tool card for a permission-gate confirm: same toolCallId as
+   * the already-emitted tool card, with locations + rawInput + a full-file diff
+   * preview. Falls back to the synthetic `pi-ui-<id>` card when the tool call was
+   * never correlated (no remembered args) — never throws.
+   */
+  private permissionGateToolCall(toolCallId: string, ev: PiRpcEvent): ToolCallUpdate {
+    const remembered = this.toolCallArgs.get(toolCallId)
+    if (!remembered) {
+      return extensionUiToolCall(stringProp(ev, 'id') ?? toolCallId, ev)
+    }
+
+    const { toolName, args } = remembered
+    const snapshot = this.fileSnapshots.get(toolCallId)
+    const locations = toToolCallLocations(args, this.cwd, editToolLine(snapshot?.oldText, args))
+    const diff = toPermissionGateDiff(toolName, args, this.cwd, snapshot)
+
+    return {
+      toolCallId,
+      title: toolCallTitle(toolName, args),
+      kind: toToolKind(toolName),
+      status: 'in_progress' as const,
+      ...(locations ? { locations } : {}),
+      rawInput: args,
+      ...(diff ? { content: [diff] } : {})
+    }
+  }
+
   private async requestExtensionPermission(
     id: string,
     ev: PiRpcEvent,
-    options: PermissionOption[]
+    options: PermissionOption[],
+    toolCall?: ToolCallUpdate
   ): Promise<PermissionResponse | null> {
     try {
       return await this.conn.requestPermission({
         sessionId: this.sessionId,
-        toolCall: extensionUiToolCall(id, ev),
+        toolCall: toolCall ?? extensionUiToolCall(id, ev),
         options
       })
     } catch {

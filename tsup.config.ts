@@ -1,7 +1,7 @@
 import { defineConfig } from 'tsup'
 
 export default defineConfig({
-  entry: ['src/index.ts', 'src/acp/pi-mcp-bridge.ts'],
+  entry: ['src/index.ts', 'src/acp/pi-mcp-bridge.ts', 'src/acp/pi-permission-gate.ts'],
   format: ['esm'],
   platform: 'node',
   target: 'node22',

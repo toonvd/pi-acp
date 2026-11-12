@@ -26,7 +26,7 @@ import {
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
-import { handoffSpawnArgs } from './mcp-handoff.js'
+import { handoffSpawnArgs, permissionGateSpawnArgs } from './mcp-handoff.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSession, readPiSessionTitle } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
@@ -202,13 +202,15 @@ export class PiAcpAgent implements ACPAgent {
       const mcpServers = opts?.mcpServers ?? this.sessions.mcpServersFor(sessionId) ?? []
 
       const handoffExtras = handoffSpawnArgs(mcpServers)
+      const gateExtras = permissionGateSpawnArgs()
       let proc: PiRpcProcess
       try {
         proc = await PiRpcProcess.spawn({
           cwd,
           sessionPath: stored.sessionFile,
           piCommand: process.env.PI_ACP_PI_COMMAND,
-          ...handoffExtras
+          ...handoffExtras,
+          extraArgs: [...(handoffExtras.extraArgs ?? []), ...(gateExtras.extraArgs ?? [])]
         })
       } catch (e: any) {
         if (e?.name === 'PiRpcSpawnError') {

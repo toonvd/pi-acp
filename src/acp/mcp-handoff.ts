@@ -135,3 +135,27 @@ export function mcpBridgePath(): string {
   }
   throw RequestError.internalError({}, 'Bundled MCP bridge extension not found alongside pi-acp')
 }
+
+/**
+ * Spawn additions mounting the permission gate extension (`--extension`). The gate
+ * is on by default; `PI_ACP_PERMISSION_GATE=0` skips it here AND inside the
+ * extension itself, so a disabled gate never even loads.
+ */
+export function permissionGateSpawnArgs(): { extraArgs: string[] } {
+  if (process.env.PI_ACP_PERMISSION_GATE === '0') return { extraArgs: [] }
+  return { extraArgs: ['--extension', permissionGatePath()] }
+}
+
+/** Absolute path of the bundled permission gate extension, in dist/ and src/ layouts. */
+export function permissionGatePath(): string {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const candidates = [
+    join(here, 'pi-permission-gate.js'),
+    join(here, 'acp', 'pi-permission-gate.js'),
+    join(here, 'pi-permission-gate.ts')
+  ]
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate
+  }
+  throw RequestError.internalError({}, 'Bundled permission gate extension not found alongside pi-acp')
+}
