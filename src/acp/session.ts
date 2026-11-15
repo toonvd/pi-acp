@@ -34,6 +34,7 @@ import {
   isBashTool
 } from './translate/bash.js'
 import { toolResultToText } from './translate/pi-tools.js'
+import { getParsedEdits, getToolPath } from './translate/tool-args.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -97,45 +98,6 @@ function findUniqueLineNumber(text: string, needle: string): number | undefined 
     if (text.charCodeAt(i) === 10) line += 1
   }
   return line
-}
-
-function getToolPath(args: unknown): string | undefined {
-  const record = args as { path?: unknown; file_path?: unknown } | null | undefined
-  if (typeof record?.path === 'string') return record.path
-  if (typeof record?.file_path === 'string') return record.file_path
-  return undefined
-}
-
-// Match pi's current edit schema: { path, edits: [{ oldText, newText }] }, with
-// legacy top-level oldText/newText still accepted. Pi also normalizes stringified edits.
-// https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/tools/edit.ts
-function getParsedEdits(args: unknown): Array<{ oldText: string; newText: string }> {
-  const record = args as { oldText?: unknown; newText?: unknown; edits?: unknown } | null | undefined
-  const parsed: Array<{ oldText: string; newText: string }> = []
-
-  if (typeof record?.oldText === 'string' && typeof record?.newText === 'string') {
-    parsed.push({ oldText: record.oldText, newText: record.newText })
-  }
-
-  let edits = record?.edits
-  if (typeof edits === 'string') {
-    try {
-      edits = JSON.parse(edits) as unknown
-    } catch {
-      edits = undefined
-    }
-  }
-
-  if (Array.isArray(edits)) {
-    for (const edit of edits) {
-      const item = edit as { oldText?: unknown; newText?: unknown } | null | undefined
-      if (typeof item?.oldText === 'string' && typeof item?.newText === 'string') {
-        parsed.push({ oldText: item.oldText, newText: item.newText })
-      }
-    }
-  }
-
-  return parsed
 }
 
 function getEditOldTexts(args: unknown): string[] {
@@ -1229,16 +1191,12 @@ function truncateTask(task: string): string {
  * emitted update's `_meta` so the hierarchy is inspectable. Absent when the
  * incoming event has no parentToolCallId — ACP has no parent/child field.
  */
-function parentToolCallMeta(
-  ev: unknown
-): { _meta: { parentToolCallId: string } } | Record<string, never> {
+function parentToolCallMeta(ev: unknown): { _meta: { parentToolCallId: string } } | Record<string, never> {
   const parentToolCallId = (ev as any)?.parentToolCallId
-  return typeof parentToolCallId === 'string' && parentToolCallId
-    ? { _meta: { parentToolCallId } }
-    : {}
+  return typeof parentToolCallId === 'string' && parentToolCallId ? { _meta: { parentToolCallId } } : {}
 }
 
-function toToolKind(toolName: string): ToolKind {
+export function toToolKind(toolName: string): ToolKind {
   switch (toolName) {
     case 'read':
       return 'read'

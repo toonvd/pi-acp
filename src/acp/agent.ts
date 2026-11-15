@@ -24,7 +24,7 @@ import {
   type DeleteSessionResponse
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
-import { SessionManager, type PiAcpSession } from './session.js'
+import { SessionManager, toToolKind, toolCallTitle, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
 import { handoffSpawnArgs } from './mcp-handoff.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
@@ -42,6 +42,7 @@ import {
   isBashTool
 } from './translate/bash.js'
 import { promptToPiMessage, promptToSessionTitle } from './translate/prompt.js'
+import { historicDiffContent, toToolCallLocations } from './translate/tool-args.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
 import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
@@ -990,6 +991,10 @@ export class PiAcpAgent implements ACPAgent {
     const data = (await proc.getMessages()) as any
     const messages = Array.isArray(data?.messages) ? data.messages : []
 
+    // Assistant messages carry tool-call arguments; remember them so historic
+    // tool results can be titled like live ones.
+    const toolCallArgs = new Map<string, unknown>()
+
     for (const m of messages) {
       const role = String(m?.role ?? '')
 
@@ -1007,6 +1012,11 @@ export class PiAcpAgent implements ACPAgent {
       }
 
       if (role === 'assistant') {
+        if (Array.isArray((m as any)?.content)) {
+          for (const block of (m as any).content) {
+            if (block?.type === 'toolCall' && typeof block.id === 'string') toolCallArgs.set(block.id, block.arguments)
+          }
+        }
         const text = normalizePiAssistantText(m?.content)
         if (text) {
           await this.conn.sessionUpdate({
@@ -1056,19 +1066,22 @@ export class PiAcpAgent implements ACPAgent {
         }
 
         // Create a synthetic ACP tool call to render historic tool usage.
+        const args = toolCallArgs.get(toolCallId)
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'tool_call',
             toolCallId,
-            title: toolName,
-            kind: toolName === 'read' ? 'read' : toolName === 'write' || toolName === 'edit' ? 'edit' : 'other',
+            title: toolCallTitle(toolName, args),
+            kind: toToolKind(toolName),
             status: 'completed',
-            rawInput: null,
+            locations: toToolCallLocations(args, params.cwd),
+            rawInput: args ?? null,
             rawOutput: m
           }
         })
 
+        const diff = isError ? undefined : historicDiffContent(toolName, args)
         const text = toolResultToText(m)
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
@@ -1076,8 +1089,8 @@ export class PiAcpAgent implements ACPAgent {
             sessionUpdate: 'tool_call_update',
             toolCallId,
             status: isError ? 'failed' : 'completed',
-            content: text ? [{ type: 'content', content: { type: 'text', text } }] : null,
-            rawOutput: m
+            content: diff ?? (text ? [{ type: 'content', content: { type: 'text', text } }] : null),
+            ...(diff ? {} : { rawOutput: m })
           }
         })
       }
