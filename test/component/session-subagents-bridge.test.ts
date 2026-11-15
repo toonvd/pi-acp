@@ -39,7 +39,9 @@ function snapshot(overrides: Record<string, unknown> = {}): string {
 }
 
 function setStatus(proc: FakePiRpcProcess, key: string, text: string, id = 'ui-1'): void {
-  proc.emit({ type: 'extension_ui_request', id, method: 'setStatus', key, text })
+  // The REAL pi RPC wire names these statusKey/statusText (verified live); the adapter
+  // must read them, not the assumed key/text.
+  proc.emit({ type: 'extension_ui_request', id, method: 'setStatus', statusKey: key, statusText: text })
 }
 
 test('PiAcpSession: subagent snapshot announces a child session with a Stop button', async () => {
