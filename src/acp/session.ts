@@ -35,6 +35,7 @@ import {
   isBashTool
 } from './translate/bash.js'
 import { toolResultToText } from './translate/pi-tools.js'
+import { todoDetailsToPlan } from './translate/plan.js'
 import { getParsedEdits, getToolPath } from './translate/tool-args.js'
 
 type SessionCreateParams = {
@@ -876,7 +877,8 @@ export class PiAcpSession {
         const toolCallId = String((ev as any).toolCallId ?? '')
         if (!toolCallId) break
 
-        const result = (ev as any).result
+        const result: unknown = ev.result
+        const toolName = ev.toolName
         const isError = Boolean((ev as any).isError)
         if (this.bashToolCallIds.has(toolCallId)) {
           this.emitBashOutputUpdate({
@@ -928,6 +930,11 @@ export class PiAcpSession {
           ...(hasStructuredDiff ? {} : { rawOutput: result }),
           ...parentToolCallMeta(ev)
         })
+
+        if (!isError && toolName === 'todo' && typeof result === 'object' && result !== null && 'details' in result) {
+          const entries = todoDetailsToPlan(result.details)
+          if (entries) this.emit({ sessionUpdate: 'plan', entries })
+        }
 
         this.cleanupToolCall(toolCallId)
         break
