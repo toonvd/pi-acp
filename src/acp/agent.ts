@@ -27,7 +27,8 @@ import { getAuthMethods } from './auth.js'
 import { SessionManager, toToolKind, toolCallTitle, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
 import { handoffSpawnArgs } from './mcp-handoff.js'
-import { ClientBridge, fsBridgePath, mergeFsSpawnArgs } from './client-bridge.js'
+import { ClientBridge, SubagentBridge, fsBridgePath, mergeFsSpawnArgs } from './client-bridge.js'
+import { subagentRunId } from './translate/subagents.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSession, readPiSessionTitle } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
@@ -137,6 +138,7 @@ export class PiAcpAgent implements ACPAgent {
   // Whether the client advertises fs.writeTextFile (Zed's review panel); read once at
   // initialize, since NewSessionRequest/LoadSessionRequest carry no clientCapabilities.
   private fsWriteEnabled = false
+  private subagentsEnabled = false
 
   constructor(conn: AgentSideConnection, _config?: unknown) {
     this.conn = conn
@@ -212,17 +214,24 @@ export class PiAcpAgent implements ACPAgent {
       const fsBridge = this.fsWriteEnabled
         ? await ClientBridge.create(this.conn, () => sessionId, { write: true })
         : undefined
+      const subagentsBridge = this.subagentsEnabled ? await SubagentBridge.create() : undefined
       let proc: PiRpcProcess
       try {
         proc = await PiRpcProcess.spawn({
           cwd,
           sessionPath: stored.sessionFile,
           piCommand: process.env.PI_ACP_PI_COMMAND,
-          ...mergeFsSpawnArgs(fsBridge, fsBridge ? ['--extension', fsBridgePath()] : undefined, handoffExtras)
+          ...mergeFsSpawnArgs(
+            fsBridge,
+            fsBridge ? ['--extension', fsBridgePath()] : undefined,
+            handoffExtras,
+            subagentsBridge
+          )
         })
       } catch (e: any) {
         // The handoff temp file holds credentials; drop it when we will not spawn.
         fsBridge?.close()
+        subagentsBridge?.close()
         handoffExtras.discard?.()
         if (e?.name === 'PiRpcSpawnError') {
           throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
@@ -237,7 +246,8 @@ export class PiAcpAgent implements ACPAgent {
         conn: this.conn,
         proc,
         fileCommands,
-        ...(fsBridge ? { fsBridge } : {})
+        ...(fsBridge ? { fsBridge } : {}),
+        ...(subagentsBridge ? { subagentsBridge } : {})
       })
 
       this.lastSessionCwd = cwd
@@ -263,6 +273,9 @@ export class PiAcpAgent implements ACPAgent {
     // (Zed's review panel); NewSessionRequest/LoadSessionRequest carry no
     // clientCapabilities, so the initialize-time capability governs every session.
     this.fsWriteEnabled = Boolean(params.clientCapabilities?.fs?.writeTextFile)
+    // Zed renders ACP subagent cards (and their Stop buttons) only when it advertised the
+    // subagents capability; it is present only while its acp-beta flag is on.
+    this.subagentsEnabled = Boolean((params.clientCapabilities as { subagents?: unknown } | undefined)?.subagents)
 
     // We currently only support ACP protocol version 1.
     const supportedVersion = 1
@@ -318,6 +331,7 @@ export class PiAcpAgent implements ACPAgent {
     const fsBridge = this.fsWriteEnabled
       ? await ClientBridge.create(this.conn, () => newSessionRef?.sessionId ?? '', { write: true })
       : undefined
+    const subagentsBridge = this.subagentsEnabled ? await SubagentBridge.create() : undefined
     let session: PiAcpSession
     try {
       session = await this.sessions.create({
@@ -326,10 +340,12 @@ export class PiAcpAgent implements ACPAgent {
         conn: this.conn,
         fileCommands,
         piCommand: process.env.PI_ACP_PI_COMMAND,
-        ...(fsBridge ? { fsBridge, fsExtraArgs: ['--extension', fsBridgePath()] } : {})
+        ...(fsBridge ? { fsBridge, fsExtraArgs: ['--extension', fsBridgePath()] } : {}),
+        ...(subagentsBridge ? { subagentsBridge } : {})
       })
     } catch (e) {
       fsBridge?.close()
+      subagentsBridge?.close()
       throw e
     }
     newSessionRef = session
@@ -939,9 +955,24 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
+    // A cancel aimed at an announced subagent stops that run instead of the parent turn.
+    const runId = subagentRunId(params.sessionId)
+    if (runId) {
+      const parent = this.sessionForSubagent(params.sessionId)
+      if (parent) await parent.cancelSubagent(runId)
+      return
+    }
     const session = this.sessions.maybeGet(params.sessionId)
     if (!session) return
     await session.cancel()
+  }
+
+  /** The parent session that announced a subagent child session. */
+  private sessionForSubagent(childSessionId: string): PiAcpSession | undefined {
+    for (const session of this.sessions.values()) {
+      if (session.ownsSubagent(childSessionId)) return session
+    }
+    return undefined
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {

@@ -1,7 +1,7 @@
 import { defineConfig } from 'tsup'
 
 export default defineConfig({
-  entry: ['src/index.ts', 'src/acp/pi-mcp-bridge.ts', 'src/acp/pi-fs-bridge.ts'],
+  entry: ['src/index.ts', 'src/acp/pi-mcp-bridge.ts', 'src/acp/pi-fs-bridge.ts', 'src/acp/pi-subagents-bridge.ts'],
   format: ['esm'],
   platform: 'node',
   target: 'node22',

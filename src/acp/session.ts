@@ -21,7 +21,7 @@ import {
 import { maybeAuthRequiredError } from './auth-required.js'
 import { SessionStore } from './session-store.js'
 import { handoffSpawnArgs } from './mcp-handoff.js'
-import { ClientBridge, mergeFsSpawnArgs } from './client-bridge.js'
+import { ClientBridge, SubagentBridge, mergeFsSpawnArgs } from './client-bridge.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import {
   bashCommand,
@@ -36,6 +36,15 @@ import {
 } from './translate/bash.js'
 import { toolResultToText } from './translate/pi-tools.js'
 import { todoDetailsToPlan } from './translate/plan.js'
+import {
+  SUBAGENT_STATUS_CLEAR_KEY,
+  SUBAGENT_STATUS_KEY_PREFIX,
+  parseSubagentSnapshot,
+  snapshotTextDelta,
+  snapshotToSubagentUpdate,
+  subagentRunId,
+  subagentSessionId
+} from './translate/subagents.js'
 import { getParsedEdits, getToolPath } from './translate/tool-args.js'
 
 type SessionCreateParams = {
@@ -48,6 +57,8 @@ type SessionCreateParams = {
   fsBridge?: ClientBridge
   /** Extra argv for pi: `--extension` the bundled fs bridge. */
   fsExtraArgs?: string[]
+  /** Bridge carrying stop requests to the bundled pi-subagents extension. */
+  subagentsBridge?: SubagentBridge
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -164,6 +175,11 @@ export class SessionManager {
     return this.sessions.get(sessionId)
   }
 
+  /** All live sessions (used to route subagent child cancels to their parent). */
+  values(): PiAcpSession[] {
+    return [...this.sessions.values()]
+  }
+
   /**
    * Dispose a session's underlying pi process and remove it from the manager.
    * Used when clients explicitly reload a session and we want a fresh pi subprocess.
@@ -171,8 +187,9 @@ export class SessionManager {
   close(sessionId: string): void {
     const s = this.sessions.get(sessionId)
     if (!s) return
-    // The bridge listens on a temp socket dir; tear it down with the subprocess.
+    // The bridges listen on temp socket dirs; tear them down with the subprocess.
     s.fsBridge?.close()
+    s.subagentsBridge?.close()
     try {
       s.proc.dispose?.()
     } catch {
@@ -215,7 +232,7 @@ export class SessionManager {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
         piCommand: params.piCommand,
-        ...mergeFsSpawnArgs(params.fsBridge, params.fsExtraArgs, handoffExtras)
+        ...mergeFsSpawnArgs(params.fsBridge, params.fsExtraArgs, handoffExtras, params.subagentsBridge)
       })
     } catch (e) {
       // The handoff temp file holds credentials; drop it when we will not spawn.
@@ -248,7 +265,8 @@ export class SessionManager {
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
       autoTitle: true,
-      fsBridge: params.fsBridge
+      fsBridge: params.fsBridge,
+      subagentsBridge: params.subagentsBridge
     })
 
     this.sessions.set(sessionId, session)
@@ -278,7 +296,8 @@ export class SessionManager {
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
       autoTitle: false,
-      fsBridge: params.fsBridge
+      fsBridge: params.fsBridge,
+      subagentsBridge: params.subagentsBridge
     })
 
     this.sessions.set(sessionId, session)
@@ -294,6 +313,8 @@ export class PiAcpSession {
 
   private startupInfo: string | null = null
   private startupInfoSent = false
+  /** Live subagent runs announced to the client, keyed by pi-subagents run id. */
+  private readonly subagentRuns = new Map<string, { text: string; status: string; signature: string }>()
   private initialTitlePending: boolean
   private lastPublishedTitle: string | null | undefined
   private titleUpdateQueue: Promise<void> = Promise.resolve()
@@ -303,6 +324,7 @@ export class PiAcpSession {
   private readonly fileCommands: FileSlashCommand[]
   /** Client-write bridge closed together with the session (undefined when not created). */
   readonly fsBridge: ClientBridge | undefined
+  readonly subagentsBridge: SubagentBridge | undefined
 
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
@@ -342,6 +364,7 @@ export class PiAcpSession {
     fileCommands?: FileSlashCommand[]
     autoTitle?: boolean
     fsBridge?: ClientBridge
+    subagentsBridge?: SubagentBridge
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -351,6 +374,7 @@ export class PiAcpSession {
     this.fileCommands = opts.fileCommands ?? []
     this.initialTitlePending = opts.autoTitle ?? false
     this.fsBridge = opts.fsBridge
+    this.subagentsBridge = opts.subagentsBridge
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }
@@ -486,11 +510,16 @@ export class PiAcpSession {
   }
 
   private emit(update: SessionUpdate): void {
+    this.emitTo(this.sessionId, update)
+  }
+
+  /** Emit under an explicit session id: subagent child sessions own their own stream. */
+  private emitTo(sessionId: string, update: SessionUpdate): void {
     // Serialize update delivery.
     this.lastEmit = this.lastEmit
       .then(() =>
         this.conn.sessionUpdate({
-          sessionId: this.sessionId,
+          sessionId,
           update
         })
       )
@@ -1047,6 +1076,11 @@ export class PiAcpSession {
       return
     }
 
+    if (method === 'setStatus') {
+      this.handleExtensionStatus(stringProp(ev, 'key'), stringProp(ev, 'text'))
+      return
+    }
+
     if (method === 'notify') {
       this.emit({
         sessionUpdate: 'agent_message_chunk',
@@ -1058,6 +1092,58 @@ export class PiAcpSession {
     }
 
     await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+  }
+
+  /**
+   * A bundled extension published a run snapshot through `ctx.ui.setStatus`. Announce the run
+   * to the client as an ACP subagent (title + optional Stop button) and stream its text into
+   * the child session so the card shows live progress.
+   */
+  private handleExtensionStatus(key: string | null, text: string | null): void {
+    if (!key) return
+    if (key === SUBAGENT_STATUS_CLEAR_KEY) {
+      this.subagentRuns.clear()
+      return
+    }
+    if (!key.startsWith(SUBAGENT_STATUS_KEY_PREFIX)) return
+    const snapshot = parseSubagentSnapshot(text)
+    if (!snapshot) return
+
+    const signature = `${snapshot.title}\u0000${snapshot.status}\u0000${snapshot.text}`
+    const prior = this.subagentRuns.get(snapshot.runId)
+    if (prior?.signature === signature) return
+    const previous = prior?.text ?? ''
+    this.subagentRuns.set(snapshot.runId, { text: snapshot.text, status: snapshot.status, signature })
+
+    const live = snapshot.status === 'running'
+    this.emit(
+      snapshotToSubagentUpdate(snapshot, {
+        cancel: live && Boolean(this.subagentsBridge)
+      }) as unknown as SessionUpdate
+    )
+
+    const delta = snapshotTextDelta(previous, snapshot.text)
+    if (delta) {
+      this.emitTo(subagentSessionId(snapshot.runId), {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: delta }
+      })
+    }
+  }
+
+  /** True when this session announced the given child session id. */
+  ownsSubagent(childSessionId: string): boolean {
+    const runId = subagentRunId(childSessionId)
+    return runId !== null && this.subagentRuns.has(runId)
+  }
+
+  /** Ask pi-subagents to stop a run; resolves false when it cannot be stopped. */
+  async cancelSubagent(runId: string): Promise<boolean> {
+    const result = await this.subagentsBridge?.cancel(runId)
+    if (!result?.ok) return false
+    const run = this.subagentRuns.get(runId)
+    if (run) run.status = 'cancelled'
+    return true
   }
 
   private async handleExtensionSelect(ev: PiRpcEvent, id: string): Promise<void> {
