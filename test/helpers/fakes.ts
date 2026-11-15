@@ -6,8 +6,16 @@ type SessionUpdateMsg = Parameters<AgentSideConnection['sessionUpdate']>[0]
 export class FakeAgentSideConnection {
   readonly updates: SessionUpdateMsg[] = []
   readonly permissionRequests: unknown[] = []
+  readonly writtenFiles: Array<{ sessionId: string; path: string; content: string }> = []
+  /** When set, `writeTextFile` rejects with this error instead of recording a write. */
+  writeTextFileError: unknown = null
   nextPermissionResponse: { outcome: { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' } } = {
     outcome: { outcome: 'selected', optionId: 'allow' }
+  }
+
+  async writeTextFile(params: { sessionId: string; path: string; content: string }): Promise<void> {
+    if (this.writeTextFileError) throw this.writeTextFileError
+    this.writtenFiles.push({ sessionId: params.sessionId, path: params.path, content: params.content })
   }
 
   async sessionUpdate(msg: SessionUpdateMsg): Promise<void> {

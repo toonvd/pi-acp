@@ -27,6 +27,7 @@ import { getAuthMethods } from './auth.js'
 import { SessionManager, toToolKind, toolCallTitle, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
 import { handoffSpawnArgs } from './mcp-handoff.js'
+import { ClientBridge, fsBridgePath, mergeFsSpawnArgs } from './client-bridge.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSession, readPiSessionTitle } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
@@ -133,6 +134,9 @@ export class PiAcpAgent implements ACPAgent {
 
   // Remember recent session cwd and use it as the default filter.
   private lastSessionCwd: string | null = null
+  // Whether the client advertises fs.writeTextFile (Zed's review panel); read once at
+  // initialize, since NewSessionRequest/LoadSessionRequest carry no clientCapabilities.
+  private fsWriteEnabled = false
 
   constructor(conn: AgentSideConnection, _config?: unknown) {
     this.conn = conn
@@ -203,16 +207,22 @@ export class PiAcpAgent implements ACPAgent {
       const mcpServers = opts?.mcpServers ?? this.sessions.mcpServersFor(sessionId) ?? []
 
       const handoffExtras = handoffSpawnArgs(mcpServers)
+      // The fs bridge routes pi file writes through the ACP client so Zed's review
+      // panel can preview them; it exists only when the client advertises write access.
+      const fsBridge = this.fsWriteEnabled
+        ? await ClientBridge.create(this.conn, () => sessionId, { write: true })
+        : undefined
       let proc: PiRpcProcess
       try {
         proc = await PiRpcProcess.spawn({
           cwd,
           sessionPath: stored.sessionFile,
           piCommand: process.env.PI_ACP_PI_COMMAND,
-          ...handoffExtras
+          ...mergeFsSpawnArgs(fsBridge, fsBridge ? ['--extension', fsBridgePath()] : undefined, handoffExtras)
         })
       } catch (e: any) {
         // The handoff temp file holds credentials; drop it when we will not spawn.
+        fsBridge?.close()
         handoffExtras.discard?.()
         if (e?.name === 'PiRpcSpawnError') {
           throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
@@ -226,7 +236,8 @@ export class PiAcpAgent implements ACPAgent {
         mcpServers,
         conn: this.conn,
         proc,
-        fileCommands
+        fileCommands,
+        ...(fsBridge ? { fsBridge } : {})
       })
 
       this.lastSessionCwd = cwd
@@ -248,6 +259,11 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
+    // Route pi file writes through the ACP client only when the client asks for it
+    // (Zed's review panel); NewSessionRequest/LoadSessionRequest carry no
+    // clientCapabilities, so the initialize-time capability governs every session.
+    this.fsWriteEnabled = Boolean(params.clientCapabilities?.fs?.writeTextFile)
+
     // We currently only support ACP protocol version 1.
     const supportedVersion = 1
     const requested = params.protocolVersion
@@ -296,13 +312,27 @@ export class PiAcpAgent implements ACPAgent {
 
     // MCP servers mount on the pi process through the bundled bridge extension
     // (spawn env + --extension); the stored copy stays as the session record.
-    const session = await this.sessions.create({
-      cwd: params.cwd,
-      mcpServers: params.mcpServers,
-      conn: this.conn,
-      fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
-    })
+    // The fs bridge routes pi file writes through the ACP client so Zed's review
+    // panel can preview them; it exists only when the client advertises write access.
+    let newSessionRef: PiAcpSession | null = null
+    const fsBridge = this.fsWriteEnabled
+      ? await ClientBridge.create(this.conn, () => newSessionRef?.sessionId ?? '', { write: true })
+      : undefined
+    let session: PiAcpSession
+    try {
+      session = await this.sessions.create({
+        cwd: params.cwd,
+        mcpServers: params.mcpServers,
+        conn: this.conn,
+        fileCommands,
+        piCommand: process.env.PI_ACP_PI_COMMAND,
+        ...(fsBridge ? { fsBridge, fsExtraArgs: ['--extension', fsBridgePath()] } : {})
+      })
+    } catch (e) {
+      fsBridge?.close()
+      throw e
+    }
+    newSessionRef = session
 
     // Fetch state + models once (parallel) to reduce startup latency.
     let state: any = null

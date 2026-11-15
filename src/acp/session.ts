@@ -21,6 +21,7 @@ import {
 import { maybeAuthRequiredError } from './auth-required.js'
 import { SessionStore } from './session-store.js'
 import { handoffSpawnArgs } from './mcp-handoff.js'
+import { ClientBridge, mergeFsSpawnArgs } from './client-bridge.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import {
   bashCommand,
@@ -42,6 +43,10 @@ type SessionCreateParams = {
   conn: AgentSideConnection
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
+  /** Bridge delegating pi file writes to the ACP client (absent when the client cannot write). */
+  fsBridge?: ClientBridge
+  /** Extra argv for pi: `--extension` the bundled fs bridge. */
+  fsExtraArgs?: string[]
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -165,6 +170,8 @@ export class SessionManager {
   close(sessionId: string): void {
     const s = this.sessions.get(sessionId)
     if (!s) return
+    // The bridge listens on a temp socket dir; tear it down with the subprocess.
+    s.fsBridge?.close()
     try {
       s.proc.dispose?.()
     } catch {
@@ -207,7 +214,7 @@ export class SessionManager {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
         piCommand: params.piCommand,
-        ...handoffExtras
+        ...mergeFsSpawnArgs(params.fsBridge, params.fsExtraArgs, handoffExtras)
       })
     } catch (e) {
       // The handoff temp file holds credentials; drop it when we will not spawn.
@@ -239,7 +246,8 @@ export class SessionManager {
       proc,
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
-      autoTitle: true
+      autoTitle: true,
+      fsBridge: params.fsBridge
     })
 
     this.sessions.set(sessionId, session)
@@ -268,7 +276,8 @@ export class SessionManager {
       proc: params.proc,
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
-      autoTitle: false
+      autoTitle: false,
+      fsBridge: params.fsBridge
     })
 
     this.sessions.set(sessionId, session)
@@ -291,6 +300,8 @@ export class PiAcpSession {
   readonly proc: PiRpcProcess
   private readonly conn: AgentSideConnection
   private readonly fileCommands: FileSlashCommand[]
+  /** Client-write bridge closed together with the session (undefined when not created). */
+  readonly fsBridge: ClientBridge | undefined
 
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
@@ -329,6 +340,7 @@ export class PiAcpSession {
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
     autoTitle?: boolean
+    fsBridge?: ClientBridge
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -337,6 +349,7 @@ export class PiAcpSession {
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
     this.initialTitlePending = opts.autoTitle ?? false
+    this.fsBridge = opts.fsBridge
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }

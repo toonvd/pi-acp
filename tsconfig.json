@@ -13,5 +13,9 @@
 
     "outDir": "dist"
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  // Ambient SDK types for the bundled fs bridge extension (pi-fs-bridge.d.ts).
+  // The pi SDK is loaded from pi's own install at runtime, so it is not a project
+  // dependency; include globs do not match .d.ts files, hence the explicit entry.
+  "files": ["src/acp/pi-fs-bridge.d.ts"]
 }
