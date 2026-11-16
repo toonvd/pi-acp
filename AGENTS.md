@@ -156,6 +156,23 @@ Children then get the fs-bridge via `--extension`, and their writes route to the
   lands on disk at the project path (child pid distinct from parent; two fs-bridge loads logged
   during diagnosis).
 
+### Plan titles now show agent + task (commit d40fc34, 2026-11-16)
+
+The user wanted `worker — Create a file at...` in the plan panel instead of a bare agent name. The
+snapshot could never carry the real task because pi-subagents redacts it to `[prompt redacted]`
+*at the source* (async event payload `task: PROMPT_REDACTED`). The only unredacted copy is the
+parent's `subagent` tool call. Pair them reliably:
+
+- `status.json` (which the extension already polls) carries a top-level `toolCallId` — verified it
+  equals the parent tool call id exactly (e.g. run `0cc9f362` ↔ `call_3201f44c…`).
+- The extension now surfaces that `toolCallId` in each run snapshot.
+- The adapter captures each parent subagent tool call's `rawInput.task` keyed by `toolCallId`
+  (`session.ts subagentTasks`), and `handleExtensionStatus` composes the plan/card title as
+  `agent — task` (`truncateTask`, ≤60 chars) when a match is found.
+- Verified via the headless harness: plan entries settle on `scout — Read the file a.txt …` after
+the first `status.json` poll (~500 ms; the very first plan transiently shows the bare agent name
+because the async-start snapshot has no `toolCallId` yet).
+
 ### Plan-panel legacy note
 
 pi 1.3.0 has **no `todo` tool** (`dist/index.js` exports only bash/edit/find/grep/ls/powershell/
