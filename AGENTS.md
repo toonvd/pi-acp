@@ -107,7 +107,7 @@ release build never advertises the `subagents` capability (the live adapter's de
 produce cards or a Stop button on a release build** — the plan panel is the one channel everyone
 has, and its entries are display-only (no stop affordance).
 
-### Subagent fleet as plan entries (Option A, commit TBD 2026-11-16)
+### Subagent fleet as plan entries (Option A, commit 09b5ae4 2026-11-16)
 
 The adapter now renders the live fleet as a full-replacement plan:
 
@@ -125,10 +125,36 @@ The adapter now renders the live fleet as a full-replacement plan:
   (`subagentsEnabled`, i.e. a staff-capable client) — normal builds just get the snapshot
   extension with no socket.
 
-Known cosmetic quirk: plan entry content can render as `[prompt redacted]` because pi-subagents
-redacts the mission objective/title at the source (visible in the raw `mission` payload); the
-snapshot inherits that string. The fleet still shows count + live spinner + completion. To fix
-fully we'd need pi-subagents to stop redacting, or to prefer the agent name.
+`[prompt redacted]` cosmetic quirk — FIXED 2026-11-16. pi-subagents redacts the mission
+objective/title at the source to the literal `[prompt redacted]` (PROMPT_REDACTED in
+`pi-subagents/src/shared/utils.js`). The bridge's `emitRun` now drops a description that equals
+that placeholder and falls back to the agent name, so plan entries render the agent (e.g. `scout`)
+instead of the placeholder. Verified live via `/tmp/probe-child-fs.mjs` and the headless harness.
+
+### Subagent edits now flow to Review (fs-bridge as required child extension, 2026-11-16)
+
+Root cause of "Review doesn't work when a subagent edits": pi-subagents spawns async children
+with `--no-extensions`, so the adapter's fs bridge (normally only loaded into the parent pi) never
+loads in the child — child edits applied to disk silently, so Zed's review panel (fed only by
+`fs/write_text_file`) saw nothing. The child **does** inherit `PI_ACP_FS_SOCKET` (only
+`PI_SUBAGENT_EXTENSION_BINDINGS` is stripped), so the bridge would delegate if it were loaded.
+
+Fix (in `src/acp/pi-subagents-bridge.ts` `registerFsBridgeForChildren`): on `session_start`, write
+the fs-bridge path into pi-subagents' global registry that it reads when launching children —
+`globalThis[Symbol.for('pi-subagents.required-child-extensions.v1')]` = `{version:1, bySession:
+Map}` — keyed by `getSessionFile() ?? getSessionId()` (both, to match `resolveCurrentSessionId`).
+Children then get the fs-bridge via `--extension`, and their writes route to the client as
+`fs/write_text_file`, populating Review.
+
+- The registry is written **in-process** (the extension shares pi's runtime) — an earlier version
+  that did `import('pi-subagents/required-child-extensions')` from the bundled extension FAILED
+  with `Cannot find package 'pi-subagents'` (pi's loader only aliases `@earendil-works/*`, and the
+  adapter's dist has no pi-subagents dependency). Writing the same global registry directly avoids
+  the import entirely.
+- Verified live via `/tmp/probe-child-fs.mjs`: a `scout` child that writes `child.txt` produces an
+  inbound `fs/write_text_file` for the correct project path with the child's content, and the file
+  lands on disk at the project path (child pid distinct from parent; two fs-bridge loads logged
+  during diagnosis).
 
 ### Plan-panel legacy note
 

@@ -28,7 +28,15 @@ interface PiExtensionApi {
   appendEntry?(customType: string, data?: unknown): string
 }
 
-type ExtensionContext = { ui?: { setStatus?(key: string, text: string): void } }
+type ExtensionContext = {
+  ui?: { setStatus?(key: string, text: string): void }
+  sessionManager?: { getSessionId?(): string; getSessionFile?(): string | undefined }
+}
+
+type ChildExtensionRegistration = { dispose(): void }
+
+/** Global registry pi-subagents reads when launching children; written in-process. */
+const REQUIRED_CHILD_EXT_KEY = 'pi-subagents.required-child-extensions.v1'
 
 const ASYNC_STARTED = 'subagent:async-started'
 const ASYNC_COMPLETE = 'subagent:async-complete'
@@ -41,6 +49,13 @@ const RPC_REPLY_PREFIX = 'subagents:rpc:v1:reply:'
 const TITLE_MAX = 512
 const TEXT_MAX = 65536
 const POLL_MS = 500
+
+/** pi-subagents redacts the child task/goal to this placeholder; never show it as a title. */
+const PROMPT_REDACTED = '[prompt redacted]'
+
+function isRedacted(value: string): boolean {
+  return value === PROMPT_REDACTED
+}
 
 type Run = {
   runId: string
@@ -102,6 +117,45 @@ export default function (pi: PiExtensionApi): void {
   const runs = new Map<string, Run>()
   let ctx: ExtensionContext | undefined
   let control: import('node:net').Socket | undefined
+  let fsRegistration: ChildExtensionRegistration | undefined
+
+  /**
+   * Make every subagent child load the fs bridge so its writes flow to the client
+   * (and Zed's review panel) instead of being applied silently to disk. pi-subagents
+   * reads a global registry when launching children and injects each entry as a
+   * `--extension` arg; the child already inherits PI_ACP_FS_SOCKET. We write that
+   * registry directly (same runtime) so no pi-subagents import is needed. Guarded so
+   * any failure simply keeps today's behaviour.
+   */
+  const registerFsBridgeForChildren = async (sessionCtx: ExtensionContext | undefined): Promise<void> => {
+    if (fsRegistration) return
+    const sm = sessionCtx?.sessionManager
+    // Match pi-subagents' resolveCurrentSessionId: getSessionFile() ?? getSessionId().
+    // The launch ctx may resolve to either, so register under both when they differ.
+    const keys = [...new Set([sm?.getSessionFile?.(), sm?.getSessionId?.()].filter((k): k is string => typeof k === 'string' && k.length > 0))]
+    if (keys.length === 0) return
+    try {
+      const { fileURLToPath } = await import('node:url')
+      const { join, dirname } = await import('node:path')
+      const { realpathSync, statSync } = await import('node:fs')
+      const fsBridgePath = realpathSync(join(dirname(fileURLToPath(import.meta.url)), 'pi-fs-bridge.js'))
+      statSync(fsBridgePath) // ensure the file is present before registering it
+      const key = Symbol.for(REQUIRED_CHILD_EXT_KEY)
+      const root = globalThis as Record<symbol, unknown>
+      const existing = root[key] as { version: number; bySession: Map<string, unknown> } | undefined
+      const store = existing ?? { version: 1, bySession: new Map<string, unknown>() }
+      root[key] = store
+      const snapshot = Object.freeze([Object.freeze({ id: 'pi-acp-fs-bridge', path: fsBridgePath })])
+      for (const k of keys) store.bySession.set(k, snapshot)
+      fsRegistration = {
+        dispose() {
+          for (const k of keys) if (store.bySession.get(k) === snapshot) store.bySession.delete(k)
+        }
+      }
+    } catch {
+      /* any failure keeps today's behaviour (children write locally, no review surface) */
+    }
+  }
 
   const setStatus = (key: string, value: string): void => {
     try {
@@ -112,12 +166,13 @@ export default function (pi: PiExtensionApi): void {
   }
 
   const emitRun = (run: Run): void => {
+    const description = run.description && !isRedacted(run.description) ? run.description : undefined
     const snapshot = JSON.stringify({
       version: 1,
       runId: run.runId,
       agent: run.agent,
-      title: clamp(collapse(run.description ?? run.agent), TITLE_MAX),
-      ...(run.description ? { description: clamp(collapse(run.description), TITLE_MAX) } : {}),
+      title: clamp(collapse(description ?? run.agent), TITLE_MAX),
+      ...(description ? { description: clamp(collapse(description), TITLE_MAX) } : {}),
       status: run.status,
       text: clamp(run.text, TEXT_MAX)
     })
@@ -191,6 +246,7 @@ export default function (pi: PiExtensionApi): void {
 
   pi.on('session_start', (_event, sessionCtx) => {
     ctx = sessionCtx as ExtensionContext
+    void registerFsBridgeForChildren(ctx)
   })
 
   pi.on('session_shutdown', () => {
@@ -199,6 +255,8 @@ export default function (pi: PiExtensionApi): void {
     setStatus('pi-acp:subagent:clear', '1')
     control?.destroy()
     control = undefined
+    fsRegistration?.dispose()
+    fsRegistration = undefined
   })
 
   // Cancel channel: the adapter asks for a run to stop; pi-subagents' in-process RPC does the work.
