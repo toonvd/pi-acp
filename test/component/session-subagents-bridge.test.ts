@@ -64,6 +64,27 @@ test('PiAcpSession: subagent snapshot announces a child session with a Stop butt
   assert.equal((child.update as any).content.text, 'step one')
 })
 
+test('PiAcpSession: subagent snapshots surface the fleet as plan entries (no bridge needed)', async () => {
+  const { conn, proc } = createSession()
+
+  setStatus(proc, 'pi-acp:subagent:run-1', snapshot())
+  await tick()
+
+  let plan = conn.updates.find(u => (u.update as any).sessionUpdate === 'plan')
+  assert.ok(plan)
+  assert.deepEqual((plan.update as any).entries, [
+    { content: 'scout — read a.txt', priority: 'medium', status: 'in_progress' }
+  ])
+
+  setStatus(proc, 'pi-acp:subagent:run-1', snapshot({ status: 'completed', text: 'done' }), 'ui-2')
+  await tick()
+
+  plan = conn.updates.filter(u => (u.update as any).sessionUpdate === 'plan').pop()!
+  assert.deepEqual((plan.update as any).entries, [
+    { content: 'scout — read a.txt', priority: 'low', status: 'completed' }
+  ])
+})
+
 test('PiAcpSession: unchanged snapshots emit nothing', async () => {
   const { conn, proc } = createSession()
   setStatus(proc, 'pi-acp:subagent:run-1', snapshot())

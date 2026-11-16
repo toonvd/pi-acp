@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
 import { connect } from 'node:net'
-import { ClientBridge, fsBridgePath, mergeFsSpawnArgs } from '../../src/acp/client-bridge.js'
+import { ClientBridge, SubagentBridge, fsBridgePath, mergeFsSpawnArgs, subagentsBridgePath } from '../../src/acp/client-bridge.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 
 function request(socketPath: string, payload: unknown): Promise<any> {
@@ -102,7 +102,7 @@ test('ClientBridge: close removes the socket directory', async () => {
   assert.equal(existsSync(bridge.path), false)
 })
 
-test('mergeFsSpawnArgs: keeps both --extension pairs and merges env without overwriting', () => {
+test('mergeFsSpawnArgs: loads the subagents bridge extension for every session and merges env without overwriting', () => {
   const merged = mergeFsSpawnArgs(
     { env: { PI_ACP_FS_SOCKET: '/tmp/sock', PI_ACP_FS_CAPS: 'write' } } as unknown as ClientBridge,
     ['--extension', '/dist/acp/pi-fs-bridge.js'],
@@ -118,13 +118,23 @@ test('mergeFsSpawnArgs: keeps both --extension pairs and merges env without over
     PI_ACP_FS_SOCKET: '/tmp/sock',
     PI_ACP_FS_CAPS: 'write'
   })
+  // The subagent snapshot extension loads for every session, even without a control socket.
   assert.deepEqual(merged.extraArgs, [
     '--extension',
     '/dist/acp/pi-mcp-bridge.js',
     '--extension',
-    '/dist/acp/pi-fs-bridge.js'
+    '/dist/acp/pi-fs-bridge.js',
+    '--extension',
+    subagentsBridgePath()
   ])
   assert.equal(typeof merged.discard, 'function')
+})
+
+test('mergeFsSpawnArgs: adds the subagent control socket env only when a bridge exists', () => {
+  const subagents = { env: { PI_ACP_SUBAGENT_SOCKET: '/tmp/sub.sock' } } as unknown as SubagentBridge
+  const merged = mergeFsSpawnArgs(undefined, undefined, {}, subagents)
+  assert.deepEqual(merged.env, { PI_ACP_SUBAGENT_SOCKET: '/tmp/sub.sock' })
+  assert.ok(merged.extraArgs!.includes(subagentsBridgePath()))
 })
 
 test('fsBridgePath: resolves the bundled extension next to the adapter sources', () => {

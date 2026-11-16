@@ -8,6 +8,7 @@ import {
   snapshotTextDelta,
   snapshotToSubagentUpdate,
   subagentRunId,
+  subagentRunsToPlan,
   subagentSessionId
 } from '../../src/acp/translate/subagents.js'
 
@@ -92,4 +93,30 @@ test('subagents: session id helpers round-trip', () => {
   assert.equal(subagentRunId('s1'), null)
   assert.equal(SUBAGENT_STATUS_KEY_PREFIX, 'pi-acp:subagent:')
   assert.equal(SUBAGENT_STATUS_CLEAR_KEY, 'pi-acp:subagent:clear')
+})
+
+test('subagents: fleet renders as a plan with running runs first', () => {
+  const runs = new Map([
+    ['run-done', { title: 'worker — ship it', status: 'completed' }],
+    ['run-live', { title: 'scout — read a.txt', status: 'running' }]
+  ])
+  assert.deepEqual(subagentRunsToPlan(runs), [
+    { content: 'scout — read a.txt', priority: 'medium', status: 'in_progress' },
+    { content: 'worker — ship it', priority: 'low', status: 'completed' }
+  ])
+})
+
+test('subagents: terminal statuses all map to completed plan entries', () => {
+  const runs = new Map([
+    ['a', { title: 'fail', status: 'failed' }],
+    ['b', { title: 'cancel', status: 'cancelled' }],
+    ['c', { title: 'done', status: 'completed' }]
+  ])
+  const plan = subagentRunsToPlan(runs)
+  assert.ok(plan)
+  assert.ok(plan.every(entry => entry.status === 'completed'))
+})
+
+test('subagents: empty fleet yields no plan', () => {
+  assert.equal(subagentRunsToPlan(new Map()), null)
 })

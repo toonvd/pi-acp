@@ -1,3 +1,5 @@
+import type { PlanEntry } from '@agentclientprotocol/sdk'
+
 /**
  * Maps pi-subagents run snapshots (published by the bundled `pi-subagents-bridge` extension
  * through `ctx.ui.setStatus`) onto ACP subagent updates.
@@ -98,4 +100,30 @@ export function snapshotTextDelta(previous: string, next: string): string {
   if (next.startsWith(previous)) return next.slice(previous.length)
   // The child rewrote its tail (tool lines get replaced); resend the tail only.
   return `\n${next.split('\n').slice(-1)[0] ?? ''}\n`
+}
+
+/** A subagent run reduced to what a plan entry needs. */
+export type SubagentRunInfo = { title: string; status: string }
+
+/**
+ * Render the live subagent fleet as a full-replacement ACP plan.
+ *
+ * Zed renders the plan panel for every client (unlike subagent cards, which it gates behind its
+ * staff-only `acp-beta` flag), so this is the universal channel for surfacing the fleet. Running
+ * runs sort first so the live work is at the top; the plan is replaced wholesale on each update.
+ * Returns null when there is nothing to show.
+ */
+export function subagentRunsToPlan(runs: ReadonlyMap<string, SubagentRunInfo>): PlanEntry[] | null {
+  const running: PlanEntry[] = []
+  const done: PlanEntry[] = []
+  for (const { title, status } of runs.values()) {
+    const entry: PlanEntry = {
+      content: title,
+      priority: status === 'running' ? 'medium' : 'low',
+      status: status === 'running' ? 'in_progress' : 'completed'
+    }
+    ;(status === 'running' ? running : done).push(entry)
+  }
+  const entries = running.concat(done)
+  return entries.length ? entries : null
 }

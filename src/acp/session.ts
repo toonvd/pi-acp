@@ -43,6 +43,7 @@ import {
   snapshotTextDelta,
   snapshotToSubagentUpdate,
   subagentRunId,
+  subagentRunsToPlan,
   subagentSessionId
 } from './translate/subagents.js'
 import { getParsedEdits, getToolPath } from './translate/tool-args.js'
@@ -314,7 +315,10 @@ export class PiAcpSession {
   private startupInfo: string | null = null
   private startupInfoSent = false
   /** Live subagent runs announced to the client, keyed by pi-subagents run id. */
-  private readonly subagentRuns = new Map<string, { text: string; status: string; signature: string }>()
+  private readonly subagentRuns = new Map<
+    string,
+    { title: string; text: string; status: string; signature: string }
+  >()
   private initialTitlePending: boolean
   private lastPublishedTitle: string | null | undefined
   private titleUpdateQueue: Promise<void> = Promise.resolve()
@@ -1118,7 +1122,12 @@ export class PiAcpSession {
     const prior = this.subagentRuns.get(snapshot.runId)
     if (prior?.signature === signature) return
     const previous = prior?.text ?? ''
-    this.subagentRuns.set(snapshot.runId, { text: snapshot.text, status: snapshot.status, signature })
+    this.subagentRuns.set(snapshot.runId, {
+      title: snapshot.title,
+      text: snapshot.text,
+      status: snapshot.status,
+      signature
+    })
 
     const live = snapshot.status === 'running'
     this.emit(
@@ -1134,6 +1143,11 @@ export class PiAcpSession {
         content: { type: 'text', text: delta }
       })
     }
+
+    // The plan panel renders for every client (Zed gates subagent cards behind its staff-only
+    // acp-beta flag), so surface the live fleet there as a full-replacement plan.
+    const plan = subagentRunsToPlan(this.subagentRuns)
+    if (plan) this.emit({ sessionUpdate: 'plan', entries: plan })
   }
 
   /** True when this session announced the given child session id. */

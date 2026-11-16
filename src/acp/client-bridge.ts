@@ -132,6 +132,10 @@ type SpawnExtras = { env?: Record<string, string>; extraArgs?: string[]; discard
  * Combine the FS bridge spawn additions with the MCP handoff ones. Both bridges are
  * bundled `--extension` files loaded by pi, so their `--extension` pairs are
  * concatenated and their env objects merged (never overwriting each other).
+ *
+ * The subagent snapshot extension is always loaded so every client can surface the fleet in the
+ * plan panel; the `PI_ACP_SUBAGENT_SOCKET` control env is only added when a control socket
+ * exists (`subagentsBridge`), i.e. when the client advertised the subagents capability.
  */
 export function mergeFsSpawnArgs(
   fsBridge: ClientBridge | undefined,
@@ -143,7 +147,8 @@ export function mergeFsSpawnArgs(
   const extraArgs = [
     ...(handoffExtras.extraArgs ?? []),
     ...(fsExtraArgs ?? []),
-    ...(subagentsBridge ? ['--extension', subagentsBridgePath()] : [])
+    '--extension',
+    subagentsBridgePath()
   ]
   const merged: SpawnExtras = {}
   if (Object.keys(env).length > 0) merged.env = env

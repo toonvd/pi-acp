@@ -91,9 +91,46 @@ For real validation, test with an ACP client (e.g. Zed external agent).
   `subagent: scout — <task>`.
 - **PASS replay** — `session/load` re-emits the edit as a `tool_call` with `locations` and a
   `diff` content block (commit b35e340).
-- **SKIP plan** — there is no plan source. See below.
+- **PASS plan (subagent fleet)** — a running subagent is surfaced as a `sessionUpdate:'plan'`
+  entry (`in_progress`, spinning), then flips to `completed` when the run finishes. Renders for
+  every client because Zed draws the plan panel unconditionally. (Option A, see below.)
 
-### Why the plan panel is empty
+### Why the subagent fleet goes through the PLAN panel, not cards
+
+Zed renders a `sessionUpdate:'plan'` for **every** client, but real `subagent_update` cards are
+welded to Zed's **staff-only** `acp-beta` flag: `feature_flags/src/store.rs:105`
+`overrides_enabled() = (cfg!(debug_assertions) || self.staff) && !*ZED_DISABLE_STAFF`. A normal
+release build never advertises the `subagents` capability (the live adapter's debug log proved
+`RAW caps keys = fs,terminal,session,auth,elicitation,_meta | subagents = undefined`), and
+`v1.rs:10341` actively drops any `subagent_update` it did not advertise. Only `ZED_DISABLE_STAFF`
+(forces off) is env-controlled; staff comes from Zed's account server. So **no adapter work can
+produce cards or a Stop button on a release build** — the plan panel is the one channel everyone
+has, and its entries are display-only (no stop affordance).
+
+### Subagent fleet as plan entries (Option A, commit TBD 2026-11-16)
+
+The adapter now renders the live fleet as a full-replacement plan:
+
+- The bundled `src/acp/pi-subagents-bridge.ts` extension is loaded for **every** session (always
+  appended to spawn args), subscribes to `subagent:async-started|async-complete|
+  foreground-complete|child-status`, and republishes one JSON snapshot per run via the only
+  working extension → adapter channel: `ctx.ui.setStatus('pi-acp:subagent:<runId>', json)`.
+- The adapter's `session.ts handleExtensionStatus` decodes each snapshot and (besides the
+  staff-gated `subagent_update` + child text delta) emits `sessionUpdate:'plan'` built by
+  `subagentRunsToPlan` (`translate/subagents.ts`): one `PlanEntry` per run, running →
+  `{status:'in_progress', priority:'medium'}`, terminal → `{status:'completed', priority:'low'}`,
+  running entries sorted first. The plan is replaced wholesale on every snapshot, so the fleet
+  stays live in the panel for every client.
+- The `PI_ACP_SUBAGENT_SOCKET` control env (for stop) is only added when a control socket exists
+  (`subagentsEnabled`, i.e. a staff-capable client) — normal builds just get the snapshot
+  extension with no socket.
+
+Known cosmetic quirk: plan entry content can render as `[prompt redacted]` because pi-subagents
+redacts the mission objective/title at the source (visible in the raw `mission` payload); the
+snapshot inherits that string. The fleet still shows count + live spinner + completion. To fix
+fully we'd need pi-subagents to stop redacting, or to prefer the agent name.
+
+### Plan-panel legacy note
 
 pi 1.3.0 has **no `todo` tool** (`dist/index.js` exports only bash/edit/find/grep/ls/powershell/
 read/write tool definitions; the string `todo` does not appear in the bundle). Our
@@ -164,5 +201,8 @@ Key facts:
   streams, Stop works, but Zed shows no in-card activity spinner.
 - Only async runs can be stopped; stopping a foreground run returns `success:false` from the RPC
   and is reported back over the socket without announcing a future cancel.
-- 248/249 tests pass. The one failure (`session-fs-bridge.test.ts` "spawns no fs bridge when the
-  client cannot write") is **pre-existing** — fails identically on `ee96e0f` baseline.
+- **248/249 tests pass. The one failure (`session-fs-bridge.test.ts` "spawns no fs bridge when the
+  client cannot write") is now FIXED** — the failure was an environmental leak (a stale
+  `PI_ACP_FS_SOCKET` exported in the runner's shell leaked into the fake pi child via
+  `process.env`); the harness now clears the three bridge env vars so the test is hermetic.
+- **After Option A: 256/256 tests, typecheck, lint all green.**

@@ -44,11 +44,19 @@ function harness(): Harness {
     cmd: process.env.PI_ACP_PI_COMMAND,
     log: process.env.FAKE_PI_LOG,
     sessionFile: process.env.FAKE_PI_SESSION_FILE,
-    home: process.env.HOME
+    home: process.env.HOME,
+    fsSocket: process.env.PI_ACP_FS_SOCKET,
+    fsCaps: process.env.PI_ACP_FS_CAPS,
+    subagentsSocket: process.env.PI_ACP_SUBAGENT_SOCKET
   }
   process.env.PI_ACP_PI_COMMAND = launcher
   process.env.FAKE_PI_LOG = logPath
   process.env.FAKE_PI_SESSION_FILE = join(root, 'sessions', 'fs-create-session.jsonl')
+  // The adapter never carries bridge env vars in its own process; clear any that leaked from
+  // the runner's shell so the child sees only what the adapter explicitly passes per-spawn.
+  delete process.env.PI_ACP_FS_SOCKET
+  delete process.env.PI_ACP_FS_CAPS
+  delete process.env.PI_ACP_SUBAGENT_SOCKET
   // Isolate SessionManager's SessionStore (paths.ts reads homedir()).
   process.env.HOME = join(root, 'home')
 
@@ -61,7 +69,10 @@ function harness(): Harness {
         ['PI_ACP_PI_COMMAND', previous.cmd],
         ['FAKE_PI_LOG', previous.log],
         ['FAKE_PI_SESSION_FILE', previous.sessionFile],
-        ['HOME', previous.home]
+        ['HOME', previous.home],
+        ['PI_ACP_FS_SOCKET', previous.fsSocket],
+        ['PI_ACP_FS_CAPS', previous.fsCaps],
+        ['PI_ACP_SUBAGENT_SOCKET', previous.subagentsSocket]
       ] as const) {
         if (env === undefined) delete process.env[key]
         else process.env[key] = env
@@ -99,9 +110,12 @@ test('SessionManager.create passes the fs bridge env and both --extension args',
     for (let i = 0; i < log.argv.length; i += 1) {
       if (log.argv[i] === '--extension') extensions.push(log.argv[i + 1])
     }
-    assert.equal(extensions.length, 2, 'both the MCP and fs bridges must be loaded')
+    assert.equal(extensions.length, 3, 'the MCP, fs and subagents bridges must be loaded')
     assert.ok(extensions.some(p => p.endsWith('pi-mcp-bridge.js') || p.endsWith('pi-mcp-bridge.ts')))
     assert.ok(extensions.some(p => p.endsWith('pi-fs-bridge.js') || p.endsWith('pi-fs-bridge.ts')))
+    assert.ok(
+      extensions.some(p => p.endsWith('pi-subagents-bridge.js') || p.endsWith('pi-subagents-bridge.ts'))
+    )
     assert.equal(existsSync(bridge.path), true)
 
     const socketPath = bridge.path
@@ -132,7 +146,18 @@ test('SessionManager.create spawns no fs bridge when the client cannot write', a
     const log = JSON.parse(readFileSync(h.logPath, 'utf8'))
     assert.equal(log.env.PI_ACP_FS_SOCKET, undefined)
     assert.equal(log.env.PI_ACP_FS_CAPS, undefined)
-    assert.equal(log.argv.includes('--extension'), false)
+    assert.equal(log.env.PI_ACP_SUBAGENT_SOCKET, undefined)
+    // The subagent snapshot extension still loads (for the plan fleet); no fs bridge is loaded.
+    assert.equal(log.argv.includes('--extension'), true)
+    const extensions: string[] = []
+    for (let i = 0; i < log.argv.length; i += 1) {
+      if (log.argv[i] === '--extension') extensions.push(log.argv[i + 1])
+    }
+    assert.equal(
+      extensions.some(p => p.endsWith('pi-fs-bridge.js') || p.endsWith('pi-fs-bridge.ts')),
+      false,
+      'no fs bridge when the client cannot write'
+    )
   } finally {
     session?.proc.dispose()
     h.restore()
