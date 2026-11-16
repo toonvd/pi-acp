@@ -34,6 +34,14 @@ test('subagents: parses a well-formed snapshot', () => {
   })
 })
 
+test('subagents: carries the paired parent toolCallId when present', () => {
+  const snapshot = parseSubagentSnapshot(
+    JSON.stringify({ version: 1, runId: 'r1', agent: 'scout', title: 'scout', status: 'running', text: '', toolCallId: 'call_123' })
+  )
+  assert.ok(snapshot)
+  assert.equal(snapshot.toolCallId, 'call_123')
+})
+
 test('subagents: malformed payloads are ignored', () => {
   assert.equal(parseSubagentSnapshot(undefined), null)
   assert.equal(parseSubagentSnapshot(''), null)

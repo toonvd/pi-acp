@@ -62,6 +62,8 @@ type Run = {
   agent: string
   description?: string
   asyncDir?: string
+  /** Parent tool-call id from `status.json`; lets the adapter pair the task text with this run. */
+  toolCallId?: string
   status: string
   text: string
   last?: string
@@ -173,6 +175,7 @@ export default function (pi: PiExtensionApi): void {
       agent: run.agent,
       title: clamp(collapse(description ?? run.agent), TITLE_MAX),
       ...(description ? { description: clamp(collapse(description), TITLE_MAX) } : {}),
+      ...(run.toolCallId ? { toolCallId: run.toolCallId } : {}),
       status: run.status,
       text: clamp(run.text, TEXT_MAX)
     })
@@ -198,6 +201,7 @@ export default function (pi: PiExtensionApi): void {
           const value = record(status)
           run.status = runStatus(value)
           run.text = statusText(value)
+          run.toolCallId = str(value.toolCallId) ?? run.toolCallId
           emitRun(run)
           if (run.status !== 'running') stopPolling(run)
         } catch {

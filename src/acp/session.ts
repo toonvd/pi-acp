@@ -319,6 +319,8 @@ export class PiAcpSession {
     string,
     { title: string; text: string; status: string; signature: string }
   >()
+  /** Task text of each parent subagent tool call, keyed by its tool-call id (pairs to a run via `status.json.toolCallId`). */
+  private readonly subagentTasks = new Map<string, string>()
   private initialTitlePending: boolean
   private lastPublishedTitle: string | null | undefined
   private titleUpdateQueue: Promise<void> = Promise.resolve()
@@ -743,6 +745,7 @@ export class PiAcpSession {
                   })()
 
             const locations = toToolCallLocations(rawInput, this.cwd)
+            if (isSubagentTool(toolName)) this.captureSubagentTask(toolCallId, rawInput)
             const existingStatus = this.currentToolCalls.get(toolCallId)
             // IMPORTANT: never downgrade status (e.g. if we already marked in_progress via tool_execution_start).
             const status = existingStatus ?? 'pending'
@@ -798,6 +801,8 @@ export class PiAcpSession {
         const toolName = String((ev as any).toolName ?? 'tool')
         const args = (ev as any).args
         let line: number | undefined
+
+        if (isSubagentTool(toolName)) this.captureSubagentTask(toolCallId, args)
 
         if (isBashTool(toolName)) {
           const locations = toToolCallLocations(args, this.cwd)
@@ -1118,12 +1123,20 @@ export class PiAcpSession {
     const snapshot = parseSubagentSnapshot(text)
     if (!snapshot) return
 
-    const signature = `${snapshot.title}\u0000${snapshot.status}\u0000${snapshot.text}`
+    // Prefer the parent tool call's real task for the title so the plan shows
+    // `agent — task` (e.g. `worker — Create a file at...`) instead of the bare
+    // agent name, which is all the redacted snapshot carries.
+    const task = snapshot.toolCallId ? this.subagentTasks.get(snapshot.toolCallId) : undefined
+    const titled = task
+      ? { ...snapshot, title: `${snapshot.agent} — ${truncateTask(task)}` }
+      : snapshot
+
+    const signature = `${titled.title}\u0000${titled.status}\u0000${titled.text}`
     const prior = this.subagentRuns.get(snapshot.runId)
     if (prior?.signature === signature) return
     const previous = prior?.text ?? ''
     this.subagentRuns.set(snapshot.runId, {
-      title: snapshot.title,
+      title: titled.title,
       text: snapshot.text,
       status: snapshot.status,
       signature
@@ -1131,7 +1144,7 @@ export class PiAcpSession {
 
     const live = snapshot.status === 'running'
     this.emit(
-      snapshotToSubagentUpdate(snapshot, {
+      snapshotToSubagentUpdate(titled, {
         cancel: live && Boolean(this.subagentsBridge)
       }) as unknown as SessionUpdate
     )
@@ -1148,6 +1161,12 @@ export class PiAcpSession {
     // acp-beta flag), so surface the live fleet there as a full-replacement plan.
     const plan = subagentRunsToPlan(this.subagentRuns)
     if (plan) this.emit({ sessionUpdate: 'plan', entries: plan })
+  }
+
+  /** Remember the real task text of a parent subagent tool call so the run's plan title can show it. */
+  private captureSubagentTask(toolCallId: string, args: unknown): void {
+    const task = subagentTaskFromArgs(args)
+    if (toolCallId && task) this.subagentTasks.set(toolCallId, task)
   }
 
   /** True when this session announced the given child session id. */
@@ -1306,9 +1325,18 @@ export function toolCallTitle(toolName: string, args: unknown): string {
   return 'subagent'
 }
 
+const PROMPT_REDACTED = '[prompt redacted]'
+
 function truncateTask(task: string): string {
   const singleLine = task.replace(/\s+/g, ' ').trim()
   return singleLine.length > 60 ? `${singleLine.slice(0, 57)}...` : singleLine
+}
+
+/** The real task text of a subagent tool call's args, when present (never the pi-side redaction). */
+function subagentTaskFromArgs(args: unknown): string | undefined {
+  const record = args as { task?: unknown } | null | undefined
+  const task = typeof record?.task === 'string' && record.task.trim() ? record.task.trim() : undefined
+  return task && task !== PROMPT_REDACTED ? task : undefined
 }
 
 /**

@@ -15,6 +15,8 @@ export type SubagentSnapshot = {
   agent: string
   title: string
   description?: string
+  /** Parent tool-call id, surfaced so the adapter can pair the run with its task text. */
+  toolCallId?: string
   status: 'running' | 'completed' | 'failed' | 'cancelled'
   text: string
 }
@@ -70,6 +72,7 @@ export function parseSubagentSnapshot(text: unknown): SubagentSnapshot | null {
     agent,
     title: clamp(str(raw.title) ?? agent, TITLE_MAX),
     ...(str(raw.description) ? { description: clamp(String(str(raw.description)), TITLE_MAX) } : {}),
+    ...(str(raw.toolCallId) ? { toolCallId: String(str(raw.toolCallId)) } : {}),
     status: normalised,
     text: clamp(typeof raw.text === 'string' ? raw.text : '', TEXT_MAX)
   }

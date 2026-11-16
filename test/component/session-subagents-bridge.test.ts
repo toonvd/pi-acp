@@ -144,3 +144,30 @@ test('PiAcpSession: cancelSubagent routes the run id to the bridge', async () =>
   assert.equal(await session.cancelSubagent('run-1'), true)
   assert.deepEqual(cancelled, ['run-1'])
 })
+
+test('PiAcpSession: plan title uses the parent tool call task paired by toolCallId (agent — task)', async () => {
+  const { conn, proc } = createSession()
+
+  // The parent launches a scout subagent with the real task text; the adapter captures it.
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 't1',
+    toolName: 'subagent',
+    args: { agent: 'scout', task: 'recon the repo layout' }
+  })
+
+  // The extension snapshot pairs to that tool call via status.json's toolCallId; its own
+  // title is just the agent (description is redacted at the pi-subagents source).
+  setStatus(proc, 'pi-acp:subagent:run-1', snapshot({ title: 'scout', description: undefined, toolCallId: 't1' }))
+  await tick()
+
+  const plan = conn.updates.find(u => (u.update as any).sessionUpdate === 'plan')
+  assert.ok(plan)
+  assert.deepEqual((plan.update as any).entries, [
+    { content: 'scout — recon the repo layout', priority: 'medium', status: 'in_progress' }
+  ])
+
+  const announced = conn.updates.find(u => (u.update as any).sessionUpdate === 'subagent_update')
+  assert.ok(announced)
+  assert.equal((announced.update as any).title, 'scout — recon the repo layout')
+})
