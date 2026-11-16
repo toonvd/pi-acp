@@ -113,6 +113,38 @@ Point your ACP client to the built `dist/index.js`:
   }
 ```
 
+#### From a cloned checkout (recommended for colleagues)
+
+Clone the repo and build once:
+
+```bash
+git clone git@github.com:toonvd/pi-acp.git
+cd pi-acp
+npm install
+npm run build
+```
+
+Then add the built adapter as a Zed agent server. In Zed, open **Zed → Settings → Open Settings** (or edit `~/.config/zed/settings.json`) and add an entry under `agent_servers` pointing at your local `dist/index.js`:
+
+```json
+  "agent_servers": {
+    "pi-acp": {
+      "type": "custom",
+      "command": "node",
+      "args": ["/absolute/path/to/pi-acp/dist/index.js"],
+      "env": {}
+    }
+  }
+```
+
+Notes for colleagues:
+
+- Replace `/absolute/path/to/pi-acp` with the real clone location.
+- Requires **Node.js 22+** and **pi v0.81.0+** on your `PATH` (see [Prerequisites](#prerequisites)). Configure pi's model providers/keys in `~/.pi/agent/settings.json` — the adapter runs `pi` and inherits its config.
+- After pulling new changes: `git pull && npm run build` (no `npm install` needed unless `package-lock.json` changed), then start a new agent session in Zed so it loads the fresh build.
+- The adapter bundles a pi extension for subagent fleet support and routes file writes through Zed for the Review panel — no extra setup beyond the steps above.
+- If you already have a `pi-acp` server defined (from the registry or `npx`), give this one a distinct key or remove the other so the two do not clash.
+
 ### Environment variables
 
 - `PI_ACP_ENABLE_EMBEDDED_CONTEXT=true` advertises ACP `promptCapabilities.embeddedContext` support to the client.
