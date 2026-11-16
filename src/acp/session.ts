@@ -1079,7 +1079,10 @@ export class PiAcpSession {
     if (method === 'setStatus') {
       // pi's real RPC names these statusKey/statusText (not key/text); reading the
       // wrong names silently dropped every subagent snapshot.
-      this.handleExtensionStatus(stringProp(ev, 'statusKey') ?? stringProp(ev, 'key'), stringProp(ev, 'statusText') ?? stringProp(ev, 'text'))
+      this.handleExtensionStatus(
+        stringProp(ev, 'statusKey') ?? stringProp(ev, 'key'),
+        stringProp(ev, 'statusText') ?? stringProp(ev, 'text')
+      )
       return
     }
 

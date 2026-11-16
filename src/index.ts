@@ -1,5 +1,6 @@
-import { AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'
+import { AgentSideConnection, ndJsonStream, type AnyMessage } from '@agentclientprotocol/sdk'
 import { PiAcpAgent } from './acp/agent.js'
+import { detectSubagentsCapability } from './acp/raw-capabilities.js'
 import { getPiCommand, shouldUseShellForPiCommand } from './pi-rpc/command.js'
 // Terminal Auth entrypoint. The ACP client launches the agent with `--terminal-login`.
 if (process.argv.includes('--terminal-login')) {
@@ -49,8 +50,27 @@ const output = new ReadableStream<Uint8Array>({
 
 const stream = ndJsonStream(input, output)
 
-const agent = new AgentSideConnection(conn => new PiAcpAgent(conn), stream)
+// The ACP SDK validates initialize params against its schema, which strips unknown
+// clientCapabilities keys (e.g. `subagents`, added in a newer ACP revision the SDK does
+// not model yet). Zed advertises `subagents` only behind its acp-beta flag; capture the
+// raw initialize request as it flows through so PiAcpAgent can see the capability even
+// though the SDK drops it before dispatch.
+let rawSubagentsCapability = false
+const interceptedReadable = stream.readable.pipeThrough(
+  new TransformStream<AnyMessage, AnyMessage>({
+    transform(message, controller) {
+      if (detectSubagentsCapability(message)) {
+        rawSubagentsCapability = true
+      }
+      controller.enqueue(message)
+    }
+  })
+)
 
+const agent = new AgentSideConnection(
+  conn => new PiAcpAgent(conn, { getSubagentsCapability: () => rawSubagentsCapability }),
+  { ...stream, readable: interceptedReadable }
+)
 function shutdown() {
   try {
     // Best-effort: dispose session subprocesses when the client disconnects.

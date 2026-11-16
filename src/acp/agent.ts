@@ -139,10 +139,13 @@ export class PiAcpAgent implements ACPAgent {
   // initialize, since NewSessionRequest/LoadSessionRequest carry no clientCapabilities.
   private fsWriteEnabled = false
   private subagentsEnabled = false
+  private readonly getSubagentsCapability: () => boolean
 
-  constructor(conn: AgentSideConnection, _config?: unknown) {
+  constructor(conn: AgentSideConnection, _config?: { getSubagentsCapability?: () => boolean }) {
     this.conn = conn
-    void _config
+    // The SDK strips `subagents` from clientCapabilities during initialize validation, so the
+    // capability is captured from the raw request in index.ts and read via this getter.
+    this.getSubagentsCapability = _config?.getSubagentsCapability ?? (() => false)
   }
 
   private cleanupFailedNewSession(sessionId: string, state?: any | null): void {
@@ -274,8 +277,9 @@ export class PiAcpAgent implements ACPAgent {
     // clientCapabilities, so the initialize-time capability governs every session.
     this.fsWriteEnabled = Boolean(params.clientCapabilities?.fs?.writeTextFile)
     // Zed renders ACP subagent cards (and their Stop buttons) only when it advertised the
-    // subagents capability; it is present only while its acp-beta flag is on.
-    this.subagentsEnabled = Boolean((params.clientCapabilities as { subagents?: unknown } | undefined)?.subagents)
+    // subagents capability; it is present only while its acp-beta flag is on. The SDK strips
+    // subagents from the validated params, so read it from the raw request instead.
+    this.subagentsEnabled = this.getSubagentsCapability()
 
     // We currently only support ACP protocol version 1.
     const supportedVersion = 1
